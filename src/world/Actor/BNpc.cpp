@@ -6,6 +6,7 @@
 #include <Network/CommonActorControl.h>
 #include <Network/PacketWrappers/EffectPacket1.h>
 #include <Logging/Logger.h>
+#include <Manager/PartyMgr.h>
 
 #include "Forwards.h"
 #include "Action/Action.h"
@@ -826,6 +827,8 @@ void BNpc::onDeath()
   auto& taskMgr = Common::Service< World::Manager::TaskMgr >::ref();
   auto& lootTableMgr = Common::Service< World::Manager::LootTableMgr >::ref();
   auto& inventoryMgr = Common::Service< World::Manager::InventoryMgr >::ref();
+  auto& exdData = Common::Service< Data::ExdData >::ref();
+  auto& partyMgr = Common::Service< World::Manager::PartyMgr >::ref();
 
   setTargetId( INVALID_GAME_OBJECT_ID64 );
   m_currentStance = Stance::Passive;
@@ -836,19 +839,80 @@ void BNpc::onDeath()
   taskMgr.queueTask( World::makeFadeBNpcTask( 10000, getAsBNpc() ) );
   taskMgr.queueTask( World::makeRemoveBNpcTask( 12000, getAsBNpc() ) );
 
-  auto& exdData = Common::Service< Data::ExdData >::ref();
   auto paramGrowthInfo = exdData.getRow< Excel::ParamGrow >( m_level );
+  if( !paramGrowthInfo )
+  {
+    hateListClear();
+    return;
+  }
 
+  uint32_t baseExp = paramGrowthInfo->data().BaseExp;
+
+  auto calcExpModifier = []( int16_t levelDiff ) -> float {
+    if( levelDiff >= 6 ) return 1.5f;// Incredibly Tough
+    else if( levelDiff >= 3 )
+      return 1.2f;// Tough - Very Tough
+    else if( levelDiff >= -2 )
+      return 1.0f;// Even Match
+    else if( levelDiff >= -5 )
+      return 0.5f;// Easy Prey
+    else
+      return 0.0f;// Too Weak
+  };
+
+  // --- hate list ---
   for( const auto& pHateEntry : m_hateList )
   {
     auto pPlayer = pHateEntry->m_pChara->getAsPlayer();
-    if( pPlayer )
-    {
-      // todo: get this outta here!
-      taskMgr.queueTask( makeLootBNpcTask( *pPlayer, "testTable", 2000 ) );
+    if( !pPlayer )
+      continue;
 
-      playerMgr.onMobKill( *pPlayer, *this );
-      playerMgr.onGainExp( *pPlayer, paramGrowthInfo->data().BaseExp );
+    // Loot queue
+    taskMgr.queueTask( makeLootBNpcTask( *pPlayer, "testTable", 2000 ) );
+
+    // Callback
+    playerMgr.onMobKill( *pPlayer, *this );
+
+    // --- EXP calculation ---
+    uint16_t playerLevel = pPlayer->getLevel();
+    int16_t levelDiff = static_cast< int16_t >( m_level ) - static_cast< int16_t >( playerLevel );
+
+    float modifier = calcExpModifier( levelDiff );
+    uint32_t finalExp = static_cast< uint32_t >( baseExp * modifier );
+
+    if( pPlayer->getPartyId() != 0 )
+    {
+      auto party = partyMgr.getParty( pPlayer->getPartyId() );
+      if( party )
+      {
+        auto members = partyMgr.getMembers( pPlayer->getPartyId() );
+        for( auto& member : members )
+        {
+          if( !member || !member->isAlive() )
+            continue;
+
+          
+          int16_t diff = static_cast< int16_t >( m_level ) - static_cast< int16_t >( member->getLevel() );
+          float mod = calcExpModifier( diff );
+          uint32_t expToGive = static_cast< uint32_t >( baseExp * mod );
+
+          // Party size penalty
+          if( members.size() > 1 )
+            expToGive /= members.size();
+
+          if( mod > 0.0f && expToGive < 1 ) expToGive = 1;
+
+          playerMgr.onGainExp( *member, expToGive );
+        }
+      }
+    }
+    else
+    {
+      // Solo
+      if( modifier > 0.0f && finalExp < 1 )
+        finalExp = 1;
+
+      playerMgr.onGainExp( *pPlayer, finalExp );
     }
   }
 
