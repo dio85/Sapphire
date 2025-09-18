@@ -67,6 +67,13 @@ namespace Sapphire::World::Manager
     ///////////////////////////
     PartyPtr getParty( uint64_t partyId );
 
+    std::vector< Entity::PlayerPtr > getMembers( uint64_t partyId )
+    {
+      auto party = getParty( partyId );
+      if( !party ) return {};
+      return getPartyMembers( *party );
+    }
+
   private:
     // arbitrary start range for party ids
     uint64_t m_maxPartyId = 0x0000044000000000;
