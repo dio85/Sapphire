@@ -615,10 +615,12 @@ int main( int argc, char *argv[ ] )
       exportMgr.exportZone( exportedZone, static_cast< ExportFileType >( exportFileType ) );
       exportedZone.groups.clear();
 
-      printf( "Built export struct for %s in %lu seconds \n",
+     printf( "Built export struct for %s in %lld seconds\n",
               zoneName.c_str(),
-              std::chrono::duration_cast< std::chrono::seconds >(
-                std::chrono::high_resolution_clock::now() - entryStartTime ).count() );
+              static_cast< long long >(
+                      std::chrono::duration_cast< std::chrono::seconds >(
+                              std::chrono::high_resolution_clock::now() - entryStartTime )
+                              .count() ) );
     } catch( std::exception& e )
     {
       printf( "%s", ( std::string( e.what() ) + "\n" ).c_str() );
@@ -630,9 +632,11 @@ int main( int argc, char *argv[ ] )
   exportMgr.waitForTasks();
   std::cout << "\n\n\n";
 
-  printf( "Finished all tasks in %lu seconds\n",
-          std::chrono::duration_cast< std::chrono::seconds >( std::chrono::high_resolution_clock::now() - startTime ).
-          count() );
+ printf( "Finished all tasks in %lld seconds\n",
+          static_cast< long long >(
+                  std::chrono::duration_cast< std::chrono::seconds >(
+                          std::chrono::high_resolution_clock::now() - startTime )
+                          .count() ) );
 
   delete eData;
   delete gameData;

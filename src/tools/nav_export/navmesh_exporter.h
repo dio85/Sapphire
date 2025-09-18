@@ -5,15 +5,12 @@
 #include <cstdint>
 #include <fstream>
 #include <string>
-
 #include <chrono>
+#include <filesystem>
 
 #include "exporter.h"
 #include "obj_exporter.h"
 #include "nav/TiledNavmeshGenerator.h"
-
-#include <filesystem>
-
 
 namespace fs = std::filesystem;
 
@@ -36,7 +33,7 @@ public:
 
     if( !gen.init( objPath.string() ) )
     {
-      printf( "[Navmesh] failed to init TiledNavmeshGenerator for file '%s'\n", zone.name.c_str() );
+      printf( "[Navmesh] Failed to init TiledNavmeshGenerator for file '%s'\n", zone.name.c_str() );
       return;
     }
 
@@ -48,11 +45,13 @@ public:
 
     gen.saveNavmesh( zone.name );
 
-
     auto end = std::chrono::high_resolution_clock::now();
-    printf( "[Navmesh] Finished exporting %s in %lu ms\n", zone.name.c_str(),
-            std::chrono::duration_cast< std::chrono::milliseconds >( end - start ).count() );
-  }
 
+    printf( "[Navmesh] Finished exporting %s in %lld ms\n",
+            zone.name.c_str(),
+            static_cast< long long >(
+                    std::chrono::duration_cast< std::chrono::milliseconds >( end - start ).count() ) );
+  }
 };
-#endif // !OBJ_EXPORTER_H
+
+#endif// !NAVMESH_EXPORTER_H
