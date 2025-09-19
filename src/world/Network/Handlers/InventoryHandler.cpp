@@ -9,6 +9,7 @@
 #include "Network/PacketWrappers/ServerNoticePacket.h"
 
 #include "Actor/Player.h"
+#include <Inventory/Item.h>
 
 #include "Session.h"
 #include "WorldServer.h"
@@ -52,10 +53,36 @@ void Sapphire::Network::GameConnection::itemOperation( const Packets::FFXIVARR_P
     }
       break;
 
-    case Common::ITEM_OPERATION_TYPE::ITEM_OPERATION_TYPE_MOVEITEM: // move item action
-    {
-      player.moveItem( fromContainer, fromSlot, toContainer, toSlot );
-    }
+    case Common::ITEM_OPERATION_TYPE::ITEM_OPERATION_TYPE_MOVEITEM:// move item action
+      {
+
+      auto srcItem = player.getItemAt( fromContainer, fromSlot );
+      if( !srcItem )
+        break;
+
+      uint32_t qty = srcItem->getStackSize();
+      bool hq = srcItem->isHq();
+
+      // Stack split
+      if( splitCount > 0 && qty > splitCount )
+      {
+        srcItem->setStackSize( qty - splitCount );
+
+        auto newItem = player.createItem( srcItem->getId(), splitCount );
+        newItem->setHq( hq );
+        newItem->setSlot( toSlot );
+
+        player.updateContainer( fromContainer, fromSlot, srcItem );
+        player.updateContainer( toContainer, toSlot, newItem );
+
+        player.writeItem( srcItem );
+        player.writeItem( newItem );
+      }
+      else
+      {
+        player.moveItem( fromContainer, fromSlot, toContainer, toSlot );
+      }
+      }
       break;
 
     case ITEM_OPERATION_TYPE::ITEM_OPERATION_TYPE_SWAPITEM: // swap item action

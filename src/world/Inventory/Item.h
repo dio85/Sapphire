@@ -69,6 +69,8 @@ namespace Sapphire
 
     uint8_t getSlot() const;
 
+    void setSlot( uint8_t slot ) { m_slot = slot; }
+
     uint32_t getMaxStackSize() const;
 
     uint16_t getDurability() const;

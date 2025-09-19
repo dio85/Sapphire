@@ -245,6 +245,20 @@ void Player::unequipItem( Common::GearSetSlot equipSlotId, Item& item, bool send
   if ( equipSlotId == SoulCrystal )
     unequipSoulCrystal();
 
+  std::pair< Common::InventoryType, uint16_t > freeSlot;
+  if( getFreeInventoryContainerSlot( freeSlot ) )
+  {
+    // Hozz létre egy ItemPtr-t a levett itemből
+    auto itemPtr = std::make_shared< Item >( item );
+
+    // Tedd be a szabad slotba
+    insertInventoryItem( freeSlot.first, freeSlot.second, itemPtr );
+  }
+  else
+  {
+    Logger::warn( "No free inventory slot to unequip item {}", item.getId() );
+  }
+
   calculateStats();
   calculateItemLevel();
 
