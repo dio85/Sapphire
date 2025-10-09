@@ -9,28 +9,27 @@ namespace Excel
   template< typename T >
   struct ExcelStruct
   {
-
-    T _data;
+    T _data{};
     std::vector< std::string > _strings;
 
     T& data()
     {
       return _data;
-    };
+    }
 
     uint8_t* ptr()
     {
       return reinterpret_cast< uint8_t* >( &_data );
-    };
+    }
 
-    const std::string& getString( Excel::StringOffset offset )
+    const std::string& getString( StringOffset offset ) const
     {
       return _strings[ offset.m_offset ];
-    };
+    }
   };
 
-  template< class T >
-  using ExcelStructPtr = std::shared_ptr< Excel::ExcelStruct< T > >;
+  template<class T>
+  using ExcelStructPtr = std::shared_ptr<ExcelStruct<T>>;
 
   /////////////////////////////////////////////////////////
 
