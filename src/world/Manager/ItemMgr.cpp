@@ -127,13 +127,13 @@ ItemPtr ItemMgr::loadItem( uint64_t uId )
   query->setUInt64( 1, uId );
 
   auto itemRes = db.query( query );
-  if( !itemRes->next() )
+  if( !itemRes || !itemRes->next() )
     return nullptr;
 
   try
   {
     auto itemInfo = exdData.getRow< Excel::Item >( itemRes->getUInt( 1 ) );
-    bool isHq = itemRes->getUInt( 3 ) == 1;
+    bool isHq = itemRes->getUInt( 5 ) != 0;
 
     ItemPtr pItem = make_Item( uId,
                                itemRes->getUInt( 1 ),
@@ -178,17 +178,18 @@ Common::ContainerType ItemMgr::getContainerType( uint32_t containerId )
   }
 }
 
-uint32_t ItemMgr::getNextUId()
+uint64_t ItemMgr::getNextUId()
 {
-  uint32_t charId;
+  // todo: fix crosstalk bug here, we're possibly creating two items of the same id
+  uint64_t charId;
 
   auto& db = Common::Service< Db::DbWorkerPool< Db::ZoneDbConnection > >::ref();
   auto pQR = db.query( "SELECT MAX(ItemId) FROM charaglobalitem" );
 
-  if( !pQR->next() )
+  if( !pQR || !pQR->next() )
     return 0x00500001;
 
-  charId = pQR->getUInt( 1 ) + 1;
+  charId = pQR->getUInt64( 1 ) + 1;
   if( charId < 0x00500001 )
     return 0x00500001;
 

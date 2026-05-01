@@ -41,7 +41,6 @@
 #include <cctype>
 
 #include "Common.h"
-#include "PreparedResultSet.h"
 
 #include <Navi/NaviProvider.h>
 #include "glm/gtc/matrix_transform.hpp"
@@ -378,6 +377,8 @@ void ZoneEditor::loadBnpcs()
   auto res = db.query( stmt );
 
   m_bnpcs.clear();
+  if( !res )
+    return;
 
   while( res->next() )
   {

@@ -30,7 +30,10 @@
 #include <vector>
 
 #include <algorithm>
+#include <array>
 #include <unordered_set>
+#include <queue>
+#include <limits>
 #include <glm/gtx/matrix_decompose.hpp>
 
 #include "Application.h"
@@ -41,7 +44,6 @@
 #include <cctype>
 
 #include "Common.h"
-#include "PreparedResultSet.h"
 
 #include <Navi/NaviProvider.h>
 #include "glm/gtc/matrix_transform.hpp"
@@ -49,6 +51,11 @@
 #include <GL/glew.h>
 
 #include "commonshader.h"
+
+#include <Util/Paths.h>
+#include <fstream>
+#include <sstream>
+#include <filesystem>
 
 extern Sapphire::Db::DbWorkerPool< Sapphire::Db::ZoneDbConnection > g_charaDb;
 
@@ -1408,6 +1415,7 @@ void ZoneEditor::cleanupNavmeshRendering()
   // Clean up geometry
   cleanupNavmeshGeometry();
   cleanupBnpcMarkerRendering();
+  cleanupEObjRendering();
 
   // Clean up shader
   if( m_navmeshShader )
@@ -1797,6 +1805,8 @@ void ZoneEditor::onSelectionChanged()
 {
   if( m_selectedZone )
   {
+    clearArenaGenerationState();
+
     // Load heavy data here
     const auto& data = m_selectedZone->data;
 
@@ -1810,6 +1820,14 @@ void ZoneEditor::onSelectionChanged()
     loadServerPaths();
     if( !m_serverPathCache.empty() )
       buildServerPathGeometry();
+
+    // EObj collision visualisation
+    m_cachedEObjCollisions.clear();
+    cleanupEObjRendering();
+    if( !m_scriptIndexBuilt )
+      buildScriptIndexCache();
+    autoDetectInstanceScript();
+
     // Reset BNPC window state when zone changes
     m_selectedBnpcIndex = -1;
     m_filteredBnpcs.clear();
@@ -2175,6 +2193,7 @@ void ZoneEditor::updateNavmeshCamera()
 void ZoneEditor::onSelectionCleared()
 {
   clearMapTexture();
+  clearArenaGenerationState();
   // Clear other loaded data
 }
 
@@ -2863,6 +2882,558 @@ void ZoneEditor::initializeServerPathShader()
   glDeleteShader( fragmentShader );
 }
 
+// ============================================================
+//  eobj collision
+// ============================================================
+
+void ZoneEditor::buildScriptIndexCache()
+{
+  m_scriptIndexCache.clear();
+  m_scriptIndexBuilt = true;
+
+  // find scripts/instances directory
+  // <repo>/build/<preset>/bin/  ->  ../../../../src/scripts/instances
+  // we need source instead of compiled scripts, consider copying script source to build
+  namespace fs = std::filesystem;
+  fs::path scriptRoot;
+
+  auto exeDir = Sapphire::Common::Util::executableDir();
+  auto candidate = exeDir / "../../../../src/scripts/instances";
+  auto candidateOoB = exeDir / "../../../src/scripts/instances";
+  if( fs::exists( candidate ) )
+    scriptRoot = fs::canonical( candidate );
+  else if( fs::exists( candidateOoB ) )
+    scriptRoot = fs::canonical( candidateOoB );
+  else
+  {
+    printf( "[EObj] Could not find scripts/instances directory (looked at: %s)\n",
+            candidate.string().c_str() );
+    return;
+  }
+
+  // regex to extract the InstanceContentScript ID from ctor
+  // match:  InstanceContentScript( 4 )   or  InstanceContentScript(20027)
+  std::regex idRe( R"(InstanceContentScript\s*\(\s*(\d+)\s*\))" );
+
+  for( auto& entry : fs::recursive_directory_iterator( scriptRoot ) )
+  {
+    if( !entry.is_regular_file() )
+      continue;
+    if( entry.path().extension() != ".cpp" )
+      continue;
+
+    std::ifstream f( entry.path() );
+    if( !f.is_open() )
+      continue;
+
+    std::string contents( ( std::istreambuf_iterator< char >( f ) ),
+                            std::istreambuf_iterator< char >() );
+
+    std::smatch m;
+    if( std::regex_search( contents, m, idRe ) )
+    {
+      uint32_t id = static_cast< uint32_t >( std::stoul( m[ 1 ] ) );
+      m_scriptIndexCache[ id ] = entry.path();
+    }
+  }
+
+  printf( "[EObj] Script index built: %zu entries\n", m_scriptIndexCache.size() );
+}
+
+void ZoneEditor::autoDetectInstanceScript()
+{
+  if( !m_selectedZone )
+    return;
+
+  auto& exdD = Engine::Service< Sapphire::Data::ExdData >::ref();
+  auto cfcIds = exdD.getIdList< Excel::InstanceContent >();
+
+  for( auto cfcId : cfcIds )
+  {
+    auto cfc = exdD.getRow< Excel::InstanceContent >( cfcId );
+    if( !cfc )
+      continue;
+    if( cfc->data().TerritoryType != m_selectedZone->id )
+      continue;
+
+    // instancecontent is real, fetch from cache
+    auto it = m_scriptIndexCache.find( cfcId );
+    if( it != m_scriptIndexCache.end() )
+    {
+      printf( "[EObj] Auto-detected script for zone %u (InstanceContent %u): %s\n",
+              m_selectedZone->id, cfcId, it->second.string().c_str() );
+      parseInstanceScript( it->second );
+      return;
+    }
+  }
+
+  printf( "[EObj] No matching instance script found for zone %u\n", m_selectedZone->id );
+}
+
+// Helper: parse a "{x, y, z}" group out of a substring match
+static bool parseVec3( const std::string& s, glm::vec3& out )
+{
+  // Strip 'f'/'F' float-literal suffixes (e.g. "1.0f" -> "1.0 ") before parsing.
+  std::string clean = s;
+  for( auto& c : clean )
+    if( c == 'f' || c == 'F' ) c = ' ';
+
+  float x, y, z;
+  if( sscanf( clean.c_str(), "%f , %f , %f", &x, &y, &z ) == 3 ||
+      sscanf( clean.c_str(), "%f,%f,%f",     &x, &y, &z ) == 3 )
+  {
+    out = { x, y, z };
+    return true;
+  }
+  return false;
+}
+
+void ZoneEditor::parseInstanceScript( const std::filesystem::path& path )
+{
+  m_cachedEObjCollisions.clear();
+  m_loadedScriptPath.clear();
+
+  std::ifstream f( path );
+  if( !f.is_open() )
+  {
+    printf( "[EObj] Failed to open script: %s\n", path.string().c_str() );
+    return;
+  }
+  std::string src( ( std::istreambuf_iterator< char >( f ) ),
+                     std::istreambuf_iterator< char >() );
+
+  // Regex for addEObj(name, baseId, boundInstanceId, instanceId, state, {x,y,z}, scale, rotation, perm)
+  // We capture: name, baseId, instanceId, position group, rotation
+  // Note: the position is the 6th argument, preceded by state (arg5) and followed by scale (arg7)
+  // Float pattern: optional leading '-', digits/dot/exponent, optional 'f' suffix
+  // The 'f?' is outside every capture group so captured strings are pure numbers.
+  std::regex eobjRe(
+    R"~(addEObj\s*\(\s*"([^"]+)"\s*,\s*(\d+)\s*,\s*\d+\s*,\s*(\d+)\s*,\s*\d+\s*,\s*\{([^}]+)\}\s*,\s*[\d.eE+\-]+f?\s*,\s*([\d.eE+\-]+)f?\s*,)~" );
+
+  // Regex for addCollisionBox({x,y,z}, rot, w, h, d)
+  std::regex boxRe(
+    R"~(addCollisionBox\s*\(\s*\{([^}]+)\}\s*,\s*([\d.eE+\-]+)f?\s*,\s*([\d.eE+\-]+)f?\s*,\s*([\d.eE+\-]+)f?\s*,\s*([\d.eE+\-]+)f?)~" );
+
+  // Regex for addCollisionCylinder({x,y,z}, radius, height)
+  std::regex cylRe(
+    R"~(addCollisionCylinder\s*\(\s*\{([^}]+)\}\s*,\s*([\d.eE+\-]+)f?\s*,\s*([\d.eE+\-]+)f?)~" );
+
+  // Regex for addCollisionSphere({x,y,z}, radius)
+  std::regex sphereRe(
+    R"~(addCollisionSphere\s*\(\s*\{([^}]+)\}\s*,\s*([\d.eE+\-]+)f?)~" );
+
+  auto srcBegin = std::sregex_iterator( src.begin(), src.end(), eobjRe );
+  auto srcEnd   = std::sregex_iterator{};
+
+  for( auto it = srcBegin; it != srcEnd; ++it )
+  {
+    const auto& eobjMatch = *it;
+    std::string eobjName   = eobjMatch[ 1 ].str();
+    uint32_t    baseId     = static_cast< uint32_t >( std::stoul( eobjMatch[ 2 ] ) );
+    uint32_t    instanceId = static_cast< uint32_t >( std::stoul( eobjMatch[ 3 ] ) );
+    glm::vec3   eobjPos{};
+    float       eobjRot    = std::stof( eobjMatch[ 5 ].str() );
+
+    if( !parseVec3( eobjMatch[ 4 ].str(), eobjPos ) )
+      continue;
+
+    // Search for collision calls following this addEObj (until the next one or end of string)
+    auto searchStart = static_cast< std::string::size_type >( eobjMatch.position() + eobjMatch.length() );
+    auto nextEObj    = ( std::next( it ) != srcEnd ) ?
+                       static_cast< std::string::size_type >( std::next( it )->position() ) :
+                       src.size();
+    std::string segment = src.substr( searchStart, nextEObj - searchStart );
+
+    // --- Boxes ---
+    auto boxIt = std::sregex_iterator( segment.begin(), segment.end(), boxRe );
+    for( auto b = boxIt; b != std::sregex_iterator{}; ++b )
+    {
+      glm::vec3 cpos{};
+      if( !parseVec3( (*b)[ 1 ].str(), cpos ) )
+        continue;
+      CachedEObjCollision c;
+      c.eobjName   = eobjName;
+      c.baseId     = baseId;
+      c.instanceId = instanceId;
+      c.eobjPos    = eobjPos;
+      c.eobjRot    = eobjRot;
+      c.type       = CachedEObjCollision::ShapeType::Box;
+      c.collPos    = cpos;
+      c.collRot    = std::stof( (*b)[ 2 ].str() );
+      c.width      = std::stof( (*b)[ 3 ].str() );
+      c.height     = std::stof( (*b)[ 4 ].str() );
+      c.depth      = std::stof( (*b)[ 5 ].str() );
+      m_cachedEObjCollisions.push_back( c );
+    }
+
+    // --- Cylinders ---
+    auto cylIt = std::sregex_iterator( segment.begin(), segment.end(), cylRe );
+    for( auto c = cylIt; c != std::sregex_iterator{}; ++c )
+    {
+      glm::vec3 cpos{};
+      if( !parseVec3( (*c)[ 1 ].str(), cpos ) )
+        continue;
+      CachedEObjCollision col;
+      col.eobjName   = eobjName;
+      col.baseId     = baseId;
+      col.instanceId = instanceId;
+      col.eobjPos    = eobjPos;
+      col.eobjRot    = eobjRot;
+      col.type       = CachedEObjCollision::ShapeType::Cylinder;
+      col.collPos    = cpos;
+      col.collRot    = 0.f;
+      col.radius     = std::stof( (*c)[ 2 ].str() );
+      col.cylinderH  = std::stof( (*c)[ 3 ].str() );
+      m_cachedEObjCollisions.push_back( col );
+    }
+
+    // --- Spheres ---
+    auto sphIt = std::sregex_iterator( segment.begin(), segment.end(), sphereRe );
+    for( auto s = sphIt; s != std::sregex_iterator{}; ++s )
+    {
+      glm::vec3 cpos{};
+      if( !parseVec3( (*s)[ 1 ].str(), cpos ) )
+        continue;
+      CachedEObjCollision col;
+      col.eobjName   = eobjName;
+      col.baseId     = baseId;
+      col.instanceId = instanceId;
+      col.eobjPos    = eobjPos;
+      col.eobjRot    = eobjRot;
+      col.type       = CachedEObjCollision::ShapeType::Sphere;
+      col.collPos    = cpos;
+      col.collRot    = 0.f;
+      col.radius     = std::stof( (*s)[ 2 ].str() );
+      m_cachedEObjCollisions.push_back( col );
+    }
+
+    // Even if no collision was found, emit a marker-only entry so the EObj origin is shown
+    if( m_cachedEObjCollisions.empty() ||
+        m_cachedEObjCollisions.back().instanceId != instanceId )
+    {
+      CachedEObjCollision marker;
+      marker.eobjName   = eobjName;
+      marker.baseId     = baseId;
+      marker.instanceId = instanceId;
+      marker.eobjPos    = eobjPos;
+      marker.eobjRot    = eobjRot;
+      marker.type       = CachedEObjCollision::ShapeType::Box;
+      marker.collPos    = eobjPos;
+      marker.width = marker.height = marker.depth = 0.f; // zero-size -> no box drawn
+      m_cachedEObjCollisions.push_back( marker );
+    }
+  }
+
+  m_loadedScriptPath = path.filename().string();
+
+  // Build GL geometry
+  buildEObjCollisionGeometry();
+  buildEObjMarkerGeometry();
+
+  printf( "[EObj] Parsed %zu collision entries from %s\n",
+          m_cachedEObjCollisions.size(), path.string().c_str() );
+}
+
+// Rotate a point around Y axis
+static glm::vec3 rotY( const glm::vec3& p, float rad )
+{
+  float c = cosf( rad ), s = sinf( rad );
+  return { p.x * c + p.z * s, p.y, -p.x * s + p.z * c };
+}
+
+void ZoneEditor::buildEObjCollisionGeometry()
+{
+  // Clean up previous
+  if( m_eobjCollisionVAO )
+  {
+    glDeleteVertexArrays( 1, &m_eobjCollisionVAO );
+    m_eobjCollisionVAO = 0;
+  }
+  if( m_eobjCollisionVBO )
+  {
+    glDeleteBuffers( 1, &m_eobjCollisionVBO );
+    m_eobjCollisionVBO = 0;
+  }
+  m_eobjCollisionVertexCount = 0;
+
+  if( m_cachedEObjCollisions.empty() )
+    return;
+
+  std::vector< float > verts;
+  verts.reserve( m_cachedEObjCollisions.size() * 72 ); // ~24 verts * 3 floats per box
+
+  auto emit = [ & ]( const glm::vec3& v )
+  {
+    verts.push_back( v.x );
+    verts.push_back( v.y );
+    verts.push_back( v.z );
+  };
+
+  auto emitLine = [ & ]( const glm::vec3& a, const glm::vec3& b )
+  {
+    emit( a );
+    emit( b );
+  };
+
+  constexpr int CYL_SEGS   = 32;
+  constexpr int SPHERE_SEGS = 32;
+
+  for( const auto& col : m_cachedEObjCollisions )
+  {
+    const glm::vec3& p = col.collPos;
+    float r = col.collRot;
+
+    if( col.type == CachedEObjCollision::ShapeType::Box )
+    {
+      if( col.width == 0.f && col.height == 0.f && col.depth == 0.f )
+        continue; // marker-only entry
+
+      float hw = col.width  * 0.5f;
+      float hh = col.height * 0.5f;
+      float hd = col.depth  * 0.5f;
+
+      // 8 OBB corners in local space
+      glm::vec3 c0 = p + rotY( { -hw, -hh, -hd }, r );
+      glm::vec3 c1 = p + rotY( {  hw, -hh, -hd }, r );
+      glm::vec3 c2 = p + rotY( { -hw, -hh,  hd }, r );
+      glm::vec3 c3 = p + rotY( {  hw, -hh,  hd }, r );
+      glm::vec3 c4 = p + rotY( { -hw,  hh, -hd }, r );
+      glm::vec3 c5 = p + rotY( {  hw,  hh, -hd }, r );
+      glm::vec3 c6 = p + rotY( { -hw,  hh,  hd }, r );
+      glm::vec3 c7 = p + rotY( {  hw,  hh,  hd }, r );
+
+      // Bottom face
+      emitLine( c0, c1 ); emitLine( c1, c3 ); emitLine( c3, c2 ); emitLine( c2, c0 );
+      // Top face
+      emitLine( c4, c5 ); emitLine( c5, c7 ); emitLine( c7, c6 ); emitLine( c6, c4 );
+      // Vertical edges
+      emitLine( c0, c4 ); emitLine( c1, c5 ); emitLine( c2, c6 ); emitLine( c3, c7 );
+    }
+    else if( col.type == CachedEObjCollision::ShapeType::Cylinder )
+    {
+      float rad = col.radius;
+      float h   = col.cylinderH;
+      // Bottom + top circles, then 4 vertical lines
+      for( int i = 0; i < CYL_SEGS; ++i )
+      {
+        float a0 = ( float ) i       / CYL_SEGS * glm::two_pi< float >();
+        float a1 = ( float )( i + 1 ) / CYL_SEGS * glm::two_pi< float >();
+        glm::vec3 b0 = p + glm::vec3( rad * cosf( a0 ), 0.f,   rad * sinf( a0 ) );
+        glm::vec3 b1 = p + glm::vec3( rad * cosf( a1 ), 0.f,   rad * sinf( a1 ) );
+        glm::vec3 t0 = p + glm::vec3( rad * cosf( a0 ), h,     rad * sinf( a0 ) );
+        glm::vec3 t1 = p + glm::vec3( rad * cosf( a1 ), h,     rad * sinf( a1 ) );
+        emitLine( b0, b1 );
+        emitLine( t0, t1 );
+      }
+      for( int i = 0; i < 4; ++i )
+      {
+        float a  = ( float ) i / 4.f * glm::two_pi< float >();
+        glm::vec3 bot = p + glm::vec3( rad * cosf( a ), 0.f, rad * sinf( a ) );
+        glm::vec3 top = p + glm::vec3( rad * cosf( a ), h,   rad * sinf( a ) );
+        emitLine( bot, top );
+      }
+    }
+    else if( col.type == CachedEObjCollision::ShapeType::Sphere )
+    {
+      float rad = col.radius;
+      // Three great circles: XZ (equator), XY, YZ
+      for( int i = 0; i < SPHERE_SEGS; ++i )
+      {
+        float a0 = ( float ) i       / SPHERE_SEGS * glm::two_pi< float >();
+        float a1 = ( float )( i + 1 ) / SPHERE_SEGS * glm::two_pi< float >();
+        // XZ equator
+        emitLine( p + glm::vec3( rad * cosf( a0 ), 0.f,           rad * sinf( a0 ) ),
+                  p + glm::vec3( rad * cosf( a1 ), 0.f,           rad * sinf( a1 ) ) );
+        // XY circle
+        emitLine( p + glm::vec3( rad * cosf( a0 ), rad * sinf( a0 ), 0.f            ),
+                  p + glm::vec3( rad * cosf( a1 ), rad * sinf( a1 ), 0.f            ) );
+        // YZ circle
+        emitLine( p + glm::vec3( 0.f,              rad * cosf( a0 ), rad * sinf( a0 ) ),
+                  p + glm::vec3( 0.f,              rad * cosf( a1 ), rad * sinf( a1 ) ) );
+      }
+    }
+  }
+
+  if( verts.empty() )
+    return;
+
+  m_eobjCollisionVertexCount = static_cast< int >( verts.size() / 3 );
+
+  glGenVertexArrays( 1, &m_eobjCollisionVAO );
+  glGenBuffers( 1, &m_eobjCollisionVBO );
+
+  glBindVertexArray( m_eobjCollisionVAO );
+  glBindBuffer( GL_ARRAY_BUFFER, m_eobjCollisionVBO );
+  glBufferData( GL_ARRAY_BUFFER,
+                static_cast< GLsizeiptr >( verts.size() * sizeof( float ) ),
+                verts.data(), GL_STATIC_DRAW );
+  glVertexAttribPointer( 0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof( float ), nullptr );
+  glEnableVertexAttribArray( 0 );
+  glBindVertexArray( 0 );
+}
+
+void ZoneEditor::buildEObjMarkerGeometry()
+{
+  if( m_eobjMarkerVAO )
+  {
+    glDeleteVertexArrays( 1, &m_eobjMarkerVAO );
+    m_eobjMarkerVAO = 0;
+  }
+  if( m_eobjMarkerVBO )
+  {
+    glDeleteBuffers( 1, &m_eobjMarkerVBO );
+    m_eobjMarkerVBO = 0;
+  }
+  m_eobjMarkerVertexCount = 0;
+
+  if( m_cachedEObjCollisions.empty() )
+    return;
+
+  // Deduplicate by instanceId so we draw one cross per EObj, not one per shape
+  std::unordered_set< uint32_t > seen;
+  std::vector< float > verts;
+  verts.reserve( m_cachedEObjCollisions.size() * 18 );
+
+  constexpr float S = 1.5f; // arm length of the cross
+
+  for( const auto& col : m_cachedEObjCollisions )
+  {
+    if( !seen.insert( col.instanceId ).second )
+      continue;
+
+    const glm::vec3& p = col.eobjPos;
+    // X axis
+    verts.insert( verts.end(), { p.x - S, p.y, p.z,
+                                  p.x + S, p.y, p.z } );
+    // Y axis
+    verts.insert( verts.end(), { p.x, p.y - S, p.z,
+                                  p.x, p.y + S, p.z } );
+    // Z axis
+    verts.insert( verts.end(), { p.x, p.y, p.z - S,
+                                  p.x, p.y, p.z + S } );
+  }
+
+  if( verts.empty() )
+    return;
+
+  m_eobjMarkerVertexCount = static_cast< int >( verts.size() / 3 );
+
+  glGenVertexArrays( 1, &m_eobjMarkerVAO );
+  glGenBuffers( 1, &m_eobjMarkerVBO );
+
+  glBindVertexArray( m_eobjMarkerVAO );
+  glBindBuffer( GL_ARRAY_BUFFER, m_eobjMarkerVBO );
+  glBufferData( GL_ARRAY_BUFFER,
+                static_cast< GLsizeiptr >( verts.size() * sizeof( float ) ),
+                verts.data(), GL_STATIC_DRAW );
+  glVertexAttribPointer( 0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof( float ), nullptr );
+  glEnableVertexAttribArray( 0 );
+  glBindVertexArray( 0 );
+}
+
+void ZoneEditor::renderEObjCollisions()
+{
+  if( !m_showEObjCollisions || !m_serverPathShader || !m_eobjCollisionVAO ||
+      m_eobjCollisionVertexCount == 0 )
+    return;
+
+  glm::mat4 view       = glm::lookAt( m_navCameraPos, m_navCameraTarget, glm::vec3( 0, 1, 0 ) );
+  glm::mat4 projection = glm::perspective( glm::radians( 45.0f ),
+                                           ( float ) m_navmeshTextureWidth / ( float ) m_navmeshTextureHeight,
+                                           0.1f, 10000.0f );
+  glm::mat4 mvp = projection * view * glm::mat4( 1.0f );
+
+  glEnable( GL_BLEND );
+  glBlendFunc( GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA );
+  glDepthMask( GL_FALSE );
+  glDisable( GL_DEPTH_TEST );
+  glLineWidth( 2.0f );
+
+  glUseProgram( m_serverPathShader );
+
+  GLint mvpLoc   = glGetUniformLocation( m_serverPathShader, "u_mvp" );
+  GLint colorLoc = glGetUniformLocation( m_serverPathShader, "u_color" );
+  if( mvpLoc != -1 )
+    glUniformMatrix4fv( mvpLoc, 1, GL_FALSE, glm::value_ptr( mvp ) );
+  if( colorLoc != -1 )
+    glUniform4f( colorLoc, 1.0f, 0.85f, 0.0f, 0.9f ); // amber/yellow — distinct from navmesh red/green
+
+  glBindVertexArray( m_eobjCollisionVAO );
+  glDrawArrays( GL_LINES, 0, m_eobjCollisionVertexCount );
+  glBindVertexArray( 0 );
+
+  glLineWidth( 1.0f );
+  glDepthMask( GL_TRUE );
+  glEnable( GL_DEPTH_TEST );
+  glUseProgram( 0 );
+}
+
+void ZoneEditor::renderEObjMarkers()
+{
+  if( !m_showEObjMarkers || !m_serverPathShader || !m_eobjMarkerVAO ||
+      m_eobjMarkerVertexCount == 0 )
+    return;
+
+  glm::mat4 view       = glm::lookAt( m_navCameraPos, m_navCameraTarget, glm::vec3( 0, 1, 0 ) );
+  glm::mat4 projection = glm::perspective( glm::radians( 45.0f ),
+                                           ( float ) m_navmeshTextureWidth / ( float ) m_navmeshTextureHeight,
+                                           0.1f, 10000.0f );
+  glm::mat4 mvp = projection * view * glm::mat4( 1.0f );
+
+  glEnable( GL_BLEND );
+  glBlendFunc( GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA );
+  glDepthMask( GL_FALSE );
+  glDisable( GL_DEPTH_TEST );
+  glLineWidth( 2.5f );
+
+  glUseProgram( m_serverPathShader );
+
+  GLint mvpLoc   = glGetUniformLocation( m_serverPathShader, "u_mvp" );
+  GLint colorLoc = glGetUniformLocation( m_serverPathShader, "u_color" );
+  if( mvpLoc != -1 )
+    glUniformMatrix4fv( mvpLoc, 1, GL_FALSE, glm::value_ptr( mvp ) );
+  if( colorLoc != -1 )
+    glUniform4f( colorLoc, 0.0f, 0.85f, 1.0f, 1.0f ); // cyan
+
+  glBindVertexArray( m_eobjMarkerVAO );
+  glDrawArrays( GL_LINES, 0, m_eobjMarkerVertexCount );
+  glBindVertexArray( 0 );
+
+  glLineWidth( 1.0f );
+  glDepthMask( GL_TRUE );
+  glEnable( GL_DEPTH_TEST );
+  glUseProgram( 0 );
+}
+
+void ZoneEditor::cleanupEObjRendering()
+{
+  if( m_eobjCollisionVAO )
+  {
+    glDeleteVertexArrays( 1, &m_eobjCollisionVAO );
+    m_eobjCollisionVAO = 0;
+  }
+  if( m_eobjCollisionVBO )
+  {
+    glDeleteBuffers( 1, &m_eobjCollisionVBO );
+    m_eobjCollisionVBO = 0;
+  }
+  m_eobjCollisionVertexCount = 0;
+
+  if( m_eobjMarkerVAO )
+  {
+    glDeleteVertexArrays( 1, &m_eobjMarkerVAO );
+    m_eobjMarkerVAO = 0;
+  }
+  if( m_eobjMarkerVBO )
+  {
+    glDeleteBuffers( 1, &m_eobjMarkerVBO );
+    m_eobjMarkerVBO = 0;
+  }
+  m_eobjMarkerVertexCount = 0;
+}
+
+// ============================================================
+
 void ZoneEditor::initializeBnpcMarkerRendering()
 {
   // Enhanced billboard vertex shader with world-space rotation
@@ -3448,6 +4019,7 @@ void ZoneEditor::renderNavmesh()
 
   // Handle 3D BNPC interaction (replaces the old 2D overlay)
   handle3DBnpcInteraction( imageScreenPos, imageSize );
+  renderArenaOverlay( ImGui::GetWindowDrawList(), imageScreenPos, imageSize );
 
   // Handle mouse interaction over the image (camera controls only)
   if( ImGui::IsItemHovered() )
@@ -3730,6 +4302,8 @@ void ZoneEditor::renderNavmeshToTexture()
   renderSenseRanges();
   renderBnpcMarkers();
   renderServerPaths();
+  renderEObjCollisions();
+  renderEObjMarkers();
   // Unbind framebuffer (back to default)
   glBindFramebuffer( GL_FRAMEBUFFER, 0 );
 }
@@ -4303,6 +4877,177 @@ void ZoneEditor::showNavmeshWindow()
   //ImGui::Text( "Zone ID: %u", m_selectedZone ? m_selectedZone->id : 0 );
   ImGui::Text( "NavMesh available: %s", m_pNaviProvider && m_pNaviProvider->getNavMesh() ? "Yes" : "No" );
 
+  // eobj and collision control
+  ImGui::Separator();
+  ImGui::Text( "EObj Collisions:" );
+  ImGui::SameLine();
+  ImGui::Checkbox( "Shapes##eobj", &m_showEObjCollisions );
+  ImGui::SameLine();
+  ImGui::Checkbox( "Markers##eobj", &m_showEObjMarkers );
+
+  if( !m_loadedScriptPath.empty() )
+  {
+    int nShapes = static_cast< int >( m_cachedEObjCollisions.size() );
+    // count unique eobj id
+    std::unordered_set< uint32_t > uniqIds;
+    for( const auto& c : m_cachedEObjCollisions )
+      uniqIds.insert( c.instanceId );
+    ImGui::TextColored( ImVec4( 0.4f, 1.0f, 0.4f, 1.0f ),
+                        "Script: %s  (%zu EObjs, %d shapes)",
+                        m_loadedScriptPath.c_str(),
+                        uniqIds.size(), nShapes );
+  }
+  else
+  {
+    ImGui::TextColored( ImVec4( 1.0f, 0.6f, 0.2f, 1.0f ), "No instance script loaded" );
+  }
+
+  ImGui::Separator();
+  ImGui::Text( "Arena Generator:" );
+
+  ImGui::Checkbox( "Show Region Overlay##arena", &m_arenaShowRegionOverlay );
+  ImGui::SameLine();
+  ImGui::Checkbox( "Show Barrier Overlay##arena", &m_arenaShowBarrierOverlay );
+
+  ImGui::SetNextItemWidth( 200.0f );
+  ImGui::SliderFloat( "Edge Snap Dist##arena", &m_arenaEdgeSnapMaxDistance, 0.5f, 6.0f, "%.2f" );
+
+  ImGui::SetNextItemWidth( 200.0f );
+  ImGui::SliderFloat( "Poly Snap XZ##arena", &m_arenaPolySnapExtentXZ, 0.5f, 8.0f, "%.2f" );
+  ImGui::SameLine();
+  ImGui::SetNextItemWidth( 200.0f );
+  ImGui::SliderFloat( "Poly Snap Y##arena", &m_arenaPolySnapExtentY, 1.0f, 24.0f, "%.2f" );
+
+  ImGui::SetNextItemWidth( 200.0f );
+  ImGui::SliderFloat( "Hybrid OBJ Margin XZ##arena", &m_arenaHybridObjMarginXZ, 4.0f, 48.0f, "%.1f" );
+  ImGui::SameLine();
+  ImGui::SetNextItemWidth( 200.0f );
+  ImGui::SliderFloat( "Hybrid OBJ Y Tolerance##arena", &m_arenaHybridObjYTolerance, 2.0f, 48.0f, "%.1f" );
+  ImGui::Checkbox( "Use Y Gate For Inside Check##arena", &m_arenaUseYGate );
+
+  if( ImGui::Button( m_arenaPickAnchorMode ? "Click navmesh to set anchor..." : "Pick Anchor" ) )
+  {
+    m_arenaPickAnchorMode = true;
+  }
+  ImGui::SameLine();
+  if( ImGui::Button( "Clear Arena State" ) )
+  {
+    clearArenaGenerationState();
+  }
+
+  if( m_arenaAnchorSet )
+  {
+    ImGui::TextColored( ImVec4( 0.2f, 1.0f, 1.0f, 1.0f ),
+                        "Anchor: (%.2f, %.2f, %.2f)", m_arenaAnchor.x, m_arenaAnchor.y, m_arenaAnchor.z );
+  }
+  else
+  {
+    ImGui::TextColored( ImVec4( 1.0f, 0.8f, 0.2f, 1.0f ), "Anchor not set" );
+  }
+
+  auto arenaCandidates = collectLineCollisionCandidates();
+  ImGui::Text( "Line Collision Boxes: %d", static_cast< int >( arenaCandidates.size() ) );
+
+  ImGui::BeginChild( "ArenaLineSelection", ImVec2( 0, 110 ), true );
+  for( auto collisionIndex : arenaCandidates )
+  {
+    if( collisionIndex < 0 || collisionIndex >= static_cast< int >( m_cachedEObjCollisions.size() ) )
+      continue;
+
+    const auto& found = m_cachedEObjCollisions[ collisionIndex ];
+
+    const bool wasSelected = m_arenaSelectedCollisionIndices.count( collisionIndex ) > 0;
+    bool selected = wasSelected;
+    std::string label = fmt::format( "[#{}] {} (inst:{} base:{} box:{}x{}x{})##arena_line_{}",
+                     collisionIndex, found.eobjName, found.instanceId, found.baseId,
+                     found.width, found.height, found.depth, collisionIndex );
+
+    if( ImGui::Checkbox( label.c_str(), &selected ) )
+    {
+      if( selected )
+        m_arenaSelectedCollisionIndices.insert( collisionIndex );
+      else
+        m_arenaSelectedCollisionIndices.erase( collisionIndex );
+
+        m_arenaResult = {};
+        m_arenaBarrierEdgeKeys.clear();
+        m_arenaBarrierEdges.clear();
+        m_arenaLastExportPath.clear();
+    }
+  }
+  ImGui::EndChild();
+
+  if( ImGui::Button( "Generate Arena Region" ) )
+  {
+    m_arenaResult = generateArenaRegion();
+    if( !m_arenaResult.ok )
+      printf( "[Arena] Generation failed: %s\n", m_arenaResult.error.c_str() );
+    else
+      printf( "[Arena] Generation success: %zu polys, %zu barrier edges, hull=%zu clipped=%zu\n",
+              m_arenaResult.region.visitedPolys.size(), m_arenaBarrierEdges.size(),
+              m_arenaResult.region.convexHull2D.size(), m_arenaResult.region.clippedHull2D.size() );
+  }
+
+  ImGui::SameLine();
+  if( ImGui::Button( "Export Arena JSON" ) )
+  {
+    if( !exportArenaGenerationJson( m_arenaResult ) )
+      printf( "[Arena] Export failed\n" );
+    else
+      printf( "[Arena] Exported to: %s\n", m_arenaLastExportPath.c_str() );
+  }
+
+  if( !m_arenaResult.ok )
+  {
+    if( !m_arenaResult.error.empty() )
+      ImGui::TextColored( ImVec4( 1.0f, 0.4f, 0.4f, 1.0f ), "Generation Error: %s", m_arenaResult.error.c_str() );
+  }
+  else
+  {
+    ImGui::TextColored( ImVec4( 0.4f, 1.0f, 0.4f, 1.0f ),
+                        "Region: %zu polys | Barriers: %zu | Hull: %zu | Clipped: %zu",
+                        m_arenaResult.region.visitedPolys.size(), m_arenaBarrierEdges.size(),
+                        m_arenaResult.region.convexHull2D.size(), m_arenaResult.region.clippedHull2D.size() );
+    ImGui::Text( "Hybrid hull + line clipping is authoritative for inside checks." );
+
+    if( m_arenaResult.region.hasYRange )
+    {
+      ImGui::Text( "Y Range: [%.2f, %.2f] (%s)",
+                   m_arenaResult.region.minY, m_arenaResult.region.maxY,
+                   m_arenaUseYGate ? "gated" : "not gated" );
+    }
+  }
+
+  if( !m_arenaLastExportPath.empty() )
+  {
+    ImGui::Text( "Last Export: %s", m_arenaLastExportPath.c_str() );
+  }
+
+  if( !m_arenaResult.warnings.empty() )
+  {
+    for( const auto& warning : m_arenaResult.warnings )
+      ImGui::TextColored( ImVec4( 1.0f, 0.8f, 0.2f, 1.0f ), "Warning: %s", warning.c_str() );
+  }
+
+  // pass script manually
+  ImGui::SetNextItemWidth( ImGui::GetContentRegionAvail().x - 60.f );
+  ImGui::InputText( "##scriptpath", m_scriptPathBuffer, sizeof( m_scriptPathBuffer ) );
+  ImGui::SameLine();
+  if( ImGui::Button( "Load##script" ) )
+  {
+    std::filesystem::path p( m_scriptPathBuffer );
+    if( std::filesystem::exists( p ) )
+    {
+      m_cachedEObjCollisions.clear();
+      cleanupEObjRendering();
+      parseInstanceScript( p );
+    }
+    else
+    {
+      printf( "[EObj] Script path does not exist: %s\n", m_scriptPathBuffer );
+    }
+  }
+
   // Add OBJ model info with more detailed status
   if( m_objLoaded )
   {
@@ -4706,6 +5451,9 @@ void ZoneEditor::showMapWindow()
       ImGui::SliderFloat( "Icon Size", &m_bnpcIconSize, 2.0f, 10.0f );
     }
 
+    ImGui::Separator();
+    ImGui::Checkbox( "Camera##map", &m_showNavCameraOnMap );
+
     if( ImGui::Button( "Reset Zoom" ) )
     {
       m_zoomLevel = 1.0f;
@@ -4832,6 +5580,12 @@ void ZoneEditor::showMapWindow()
       drawBnpcIcons();
     }
 
+    // Draw camera position and FOV cone overlay
+    if( m_showNavCameraOnMap )
+    {
+      drawNavCameraOnMap( imagePos, imageSize );
+    }
+
     // Handle panning (drag to move when zoomed in)
     if( ImGui::IsItemHovered() && ImGui::IsMouseDragging( ImGuiMouseButton_Left ) )
     {
@@ -4921,6 +5675,30 @@ void ZoneEditor::showMapWindow()
       // Note: This is the inverse of get2dPosFrom3d
       float worldX = ( mapX - 1024.0f ) / ( m_mapScale / 100.0f );
       float worldZ = ( mapY - 1024.0f ) / ( m_mapScale / 100.0f );
+
+      if( m_arenaPickAnchorMode && ( ImGui::IsMouseClicked( ImGuiMouseButton_Left ) || ImGui::IsMouseClicked( ImGuiMouseButton_Right ) ) )
+      {
+        m_arenaResult = {};
+        m_arenaBarrierEdgeKeys.clear();
+        m_arenaBarrierEdges.clear();
+        m_arenaLastExportPath.clear();
+
+        if( m_pNaviProvider )
+        {
+          auto nearestPos = m_pNaviProvider->findNearestPosition( worldX, worldZ );
+          m_arenaAnchor = glm::vec3( nearestPos.x, nearestPos.y, nearestPos.z );
+        }
+        else
+        {
+          m_arenaAnchor = glm::vec3( worldX, 0.0f, worldZ );
+        }
+
+        m_arenaAnchorSet = true;
+        m_arenaPickAnchorMode = false;
+        m_showClickMarker = true;
+        m_lastClickWorldPos = m_arenaAnchor;
+        printf( "[Arena] Anchor set from map to (%.2f, %.2f, %.2f)\n", m_arenaAnchor.x, m_arenaAnchor.y, m_arenaAnchor.z );
+      }
 
       // Format the position strings
       char mapPosText[ 128 ];
@@ -5108,6 +5886,68 @@ ImVec2 ZoneEditor::worldToScreenPos( float worldX, float worldZ, const ImVec2& i
   screenPos.y = imagePos.y + ( normalizedY * imageSize.y );
 
   return screenPos;
+}
+
+void ZoneEditor::drawNavCameraOnMap( const ImVec2& imagePos, const ImVec2& imageSize )
+{
+  if( !m_selectedZone )
+    return;
+
+  ImDrawList* drawList = ImGui::GetWindowDrawList();
+
+  // camera target: the point the 3D camera orbits around
+  ImVec2 targetScreenPos = worldToScreenPos( m_navCameraTarget.x, m_navCameraTarget.z, imagePos, imageSize );
+
+  // camera position projected onto xz plane
+  ImVec2 camScreenPos = worldToScreenPos( m_navCameraPos.x, m_navCameraPos.z, imagePos, imageSize );
+
+  // view direction: from camera toward target, in screen space (x=right, z=down)
+  float yawRad = glm::radians( m_navCameraYaw );
+  // viewDir on screen: +X world -> right, +Z world -> down
+  // cam offset from target = (cos(yaw), sin(yaw)), so viewDir toward target = (-cos(yaw), -sin(yaw))
+  float vdx = -cosf( yawRad );
+  float vdz = -sinf( yawRad );
+
+  // cone length in screen pixels, use fixed size
+  const float coneLen = 36.0f;
+  const float halfFovRad = glm::radians( 22.5f ); // half of 45deg vertical FOV
+
+  // rotate viewDir by mod of halfFov to get cone edges
+  auto rot2d = []( float dx, float dy, float angle ) -> ImVec2 {
+    float c = cosf( angle ), s = sinf( angle );
+    return { dx * c - dy * s, dx * s + dy * c };
+  };
+
+  ImVec2 leftDir  = rot2d( vdx, vdz, -halfFovRad );
+  ImVec2 rightDir = rot2d( vdx, vdz,  halfFovRad );
+
+  ImVec2 coneLeft  = { camScreenPos.x + leftDir.x  * coneLen, camScreenPos.y + leftDir.y  * coneLen };
+  ImVec2 coneRight = { camScreenPos.x + rightDir.x * coneLen, camScreenPos.y + rightDir.y * coneLen };
+
+  // draw cone
+  drawList->AddTriangleFilled( camScreenPos, coneLeft, coneRight, IM_COL32( 255, 255, 255, 45 ) );
+
+  // draw cone outline
+  drawList->AddLine( camScreenPos, coneLeft,  IM_COL32( 255, 255, 255, 200 ), 1.5f );
+  drawList->AddLine( camScreenPos, coneRight, IM_COL32( 255, 255, 255, 200 ), 1.5f );
+  drawList->AddLine( coneLeft, coneRight,     IM_COL32( 255, 255, 255, 120 ), 1.0f );
+
+  // camera position dot
+  drawList->AddCircleFilled( camScreenPos, 4.0f, IM_COL32( 255, 255, 255, 230 ) );
+  drawList->AddCircle( camScreenPos, 4.0f, IM_COL32( 0, 0, 0, 180 ), 0, 1.5f );
+
+  // crosshair
+  const float crossR = 4.0f;
+  drawList->AddLine( { targetScreenPos.x - crossR, targetScreenPos.y },
+                     { targetScreenPos.x + crossR, targetScreenPos.y },
+                     IM_COL32( 255, 220, 100, 200 ), 1.5f );
+  drawList->AddLine( { targetScreenPos.x, targetScreenPos.y - crossR },
+                     { targetScreenPos.x, targetScreenPos.y + crossR },
+                     IM_COL32( 255, 220, 100, 200 ), 1.5f );
+  drawList->AddCircle( targetScreenPos, crossR + 1.0f, IM_COL32( 255, 220, 100, 160 ), 0, 1.0f );
+
+  // line cam -> target
+  drawList->AddLine( camScreenPos, targetScreenPos, IM_COL32( 255, 220, 100, 80 ), 1.0f );
 }
 
 void ZoneEditor::drawBnpcIcons()
@@ -5321,9 +6161,9 @@ ZoneEditor::Ray ZoneEditor::screenToWorldRay( const ImVec2& screenPos, const ImV
   return ray;
 }
 
-// Ray-triangle intersection using Möller-Trumbore algorithm with backface culling
+  // Ray-triangle intersection using Möller-Trumbore algorithm
 bool ZoneEditor::rayTriangleIntersect( const Ray& ray, const glm::vec3& v0, const glm::vec3& v1, const glm::vec3& v2,
-                                       float& distance, glm::vec3& normal )
+                        float& distance, glm::vec3& normal )
 {
   const float EPSILON = 0.0000001f;
 
@@ -5364,15 +6204,6 @@ bool ZoneEditor::rayTriangleIntersect( const Ray& ray, const glm::vec3& v0, cons
 
     // Calculate triangle normal
     normal = glm::normalize( glm::cross( edge1, edge2 ) );
-
-    // Backface culling: only accept hits from the front side
-    // If dot product is positive, ray is hitting the back of the triangle
-    float backfaceCheck = glm::dot( ray.direction, normal );
-    if( backfaceCheck > 0.0f )
-    {
-      return false; // Hit backface, reject
-    }
-
     return true;
   }
 
@@ -5533,6 +6364,17 @@ void ZoneEditor::renderWorldMarker( const glm::vec3& worldPos )
 // Callback for world clicking - implement your editing logic here
 void ZoneEditor::onWorldClick( const RayHit& hit )
 {
+  if( m_arenaPickAnchorMode )
+  {
+    m_arenaAnchor = hit.position;
+    m_arenaAnchorSet = true;
+    m_arenaPickAnchorMode = false;
+    m_showClickMarker = true;
+    m_lastClickWorldPos = hit.position;
+    printf( "[Arena] Anchor set to (%.2f, %.2f, %.2f)\n", hit.position.x, hit.position.y, hit.position.z );
+    return;
+  }
+
   // Example: Create a new BNPC at the clicked position
   if( m_worldEditingMode )
   {
@@ -5547,5 +6389,1023 @@ void ZoneEditor::onWorldClick( const RayHit& hit )
       printf( "Nearest walkable position: (%.2f, %.2f, %.2f)\n",
               nearestPos.x, nearestPos.y, nearestPos.z );
     }
+  }
+}
+
+void ZoneEditor::clearArenaGenerationState()
+{
+  m_arenaPickAnchorMode = false;
+  m_arenaAnchorSet = false;
+  m_arenaSelectedCollisionIndices.clear();
+  m_arenaBarrierEdgeKeys.clear();
+  m_arenaBarrierEdges.clear();
+  m_arenaResult = {};
+  m_arenaLastExportPath.clear();
+}
+
+std::vector< int > ZoneEditor::collectLineCollisionCandidates() const
+{
+  std::vector< int > candidates;
+
+  for( int i = 0; i < static_cast< int >( m_cachedEObjCollisions.size() ); ++i )
+  {
+    if( resolveLineEndpointsFromCollisionIndex( i ).has_value() )
+    {
+      candidates.push_back( i );
+    }
+  }
+
+  return candidates;
+}
+
+std::optional< std::pair< glm::vec3, glm::vec3 > > ZoneEditor::resolveLineEndpointsFromCollisionIndex( int collisionIndex ) const
+{
+  if( collisionIndex < 0 || collisionIndex >= static_cast< int >( m_cachedEObjCollisions.size() ) )
+    return std::nullopt;
+
+  const auto& entry = m_cachedEObjCollisions[ collisionIndex ];
+  if( entry.type != CachedEObjCollision::ShapeType::Box )
+    return std::nullopt;
+
+  if( entry.width <= 0.0f || entry.depth <= 0.0f )
+    return std::nullopt;
+
+  const bool useXMajor = entry.width >= entry.depth;
+  const float halfLength = ( useXMajor ? entry.width : entry.depth ) * 0.5f;
+  const float c = std::cos( entry.collRot );
+  const float s = std::sin( entry.collRot );
+
+  glm::vec3 axis;
+  if( useXMajor )
+    axis = glm::vec3( c, 0.0f, -s );
+  else
+    axis = glm::vec3( s, 0.0f, c );
+
+  glm::vec3 pointA = entry.collPos - axis * halfLength;
+  glm::vec3 pointB = entry.collPos + axis * halfLength;
+  return std::make_pair( pointA, pointB );
+}
+
+std::optional< dtPolyRef > ZoneEditor::findNearestPolyForPoint( const glm::vec3& worldPos, const float* extents,
+                                                                float* nearestOut ) const
+{
+  if( !m_pNaviProvider )
+    return std::nullopt;
+
+  const dtNavMesh* navMesh = m_pNaviProvider->getNavMesh();
+  if( !navMesh )
+    return std::nullopt;
+
+  dtNavMeshQuery* query = dtAllocNavMeshQuery();
+  if( !query )
+    return std::nullopt;
+
+  if( dtStatusFailed( query->init( navMesh, 2048 ) ) )
+  {
+    dtFreeNavMeshQuery( query );
+    return std::nullopt;
+  }
+
+  dtQueryFilter filter;
+  filter.setIncludeFlags( 0xffff );
+  filter.setExcludeFlags( 0 );
+
+  float pos[ 3 ] = { worldPos.x, worldPos.y, worldPos.z };
+  float nearest[ 3 ] = { 0.0f, 0.0f, 0.0f };
+  dtPolyRef nearestRef = 0;
+
+  dtStatus status = query->findNearestPoly( pos, extents, &filter, &nearestRef, nearest );
+  dtFreeNavMeshQuery( query );
+
+  if( dtStatusFailed( status ) || nearestRef == 0 )
+    return std::nullopt;
+
+  if( nearestOut )
+  {
+    nearestOut[ 0 ] = nearest[ 0 ];
+    nearestOut[ 1 ] = nearest[ 1 ];
+    nearestOut[ 2 ] = nearest[ 2 ];
+  }
+
+  return nearestRef;
+}
+
+static float pointToSegmentDistance2D( const glm::vec3& point, const glm::vec3& segA, const glm::vec3& segB )
+{
+  glm::vec2 p( point.x, point.z );
+  glm::vec2 a( segA.x, segA.z );
+  glm::vec2 b( segB.x, segB.z );
+  glm::vec2 ab = b - a;
+  float lenSq = glm::dot( ab, ab );
+
+  if( lenSq <= 0.000001f )
+    return glm::length( p - a );
+
+  float t = glm::dot( p - a, ab ) / lenSq;
+  t = glm::clamp( t, 0.0f, 1.0f );
+  glm::vec2 closest = a + ab * t;
+  return glm::length( p - closest );
+}
+
+static bool pointsNear2D( const float* a, const float* b, float epsilon )
+{
+  return std::fabs( a[ 0 ] - b[ 0 ] ) <= epsilon && std::fabs( a[ 2 ] - b[ 2 ] ) <= epsilon;
+}
+
+std::optional< ZoneEditor::ArenaBarrierEdge > ZoneEditor::findNearestEdgeOnPoly( dtPolyRef polyRef, const glm::vec3& worldPos,
+                                                                                  float maxEdgeDist ) const
+{
+  if( !m_pNaviProvider )
+    return std::nullopt;
+
+  const dtNavMesh* navMesh = m_pNaviProvider->getNavMesh();
+  if( !navMesh )
+    return std::nullopt;
+
+  const dtMeshTile* tile = nullptr;
+  const dtPoly* poly = nullptr;
+  if( dtStatusFailed( navMesh->getTileAndPolyByRef( polyRef, &tile, &poly ) ) || !tile || !poly )
+    return std::nullopt;
+
+  if( poly->getType() == DT_POLYTYPE_OFFMESH_CONNECTION )
+    return std::nullopt;
+
+  float bestDist = std::numeric_limits< float >::max();
+  int bestEdge = -1;
+
+  for( int i = 0; i < poly->vertCount; ++i )
+  {
+    const int next = ( i + 1 ) % poly->vertCount;
+    const float* va = &tile->verts[ poly->verts[ i ] * 3 ];
+    const float* vb = &tile->verts[ poly->verts[ next ] * 3 ];
+    float dist = pointToSegmentDistance2D( worldPos,
+                                           glm::vec3( va[ 0 ], va[ 1 ], va[ 2 ] ),
+                                           glm::vec3( vb[ 0 ], vb[ 1 ], vb[ 2 ] ) );
+    if( dist < bestDist )
+    {
+      bestDist = dist;
+      bestEdge = i;
+    }
+  }
+
+  if( bestEdge < 0 || bestDist > maxEdgeDist )
+    return std::nullopt;
+
+  ArenaBarrierEdge edge;
+  edge.polyRef = polyRef;
+  edge.edgeIndex = static_cast< uint8_t >( bestEdge );
+
+  for( uint32_t linkIndex = poly->firstLink; linkIndex != DT_NULL_LINK; linkIndex = tile->links[ linkIndex ].next )
+  {
+    const dtLink& link = tile->links[ linkIndex ];
+    if( link.edge == bestEdge && link.ref != 0 )
+    {
+      edge.neighborRef = link.ref;
+      break;
+    }
+  }
+
+  return edge;
+}
+
+bool ZoneEditor::expandBarrierToTwinEdge( const ArenaBarrierEdge& src, ArenaBarrierEdge& dst ) const
+{
+  if( !m_pNaviProvider || src.neighborRef == 0 )
+    return false;
+
+  const dtNavMesh* navMesh = m_pNaviProvider->getNavMesh();
+  if( !navMesh )
+    return false;
+
+  const dtMeshTile* srcTile = nullptr;
+  const dtPoly* srcPoly = nullptr;
+  if( dtStatusFailed( navMesh->getTileAndPolyByRef( src.polyRef, &srcTile, &srcPoly ) ) || !srcTile || !srcPoly )
+    return false;
+
+  const int srcNext = ( src.edgeIndex + 1 ) % srcPoly->vertCount;
+  const float* srcA = &srcTile->verts[ srcPoly->verts[ src.edgeIndex ] * 3 ];
+  const float* srcB = &srcTile->verts[ srcPoly->verts[ srcNext ] * 3 ];
+
+  const dtMeshTile* dstTile = nullptr;
+  const dtPoly* dstPoly = nullptr;
+  if( dtStatusFailed( navMesh->getTileAndPolyByRef( src.neighborRef, &dstTile, &dstPoly ) ) || !dstTile || !dstPoly )
+    return false;
+
+  constexpr float edgeMatchEps = 0.15f;
+
+  for( int i = 0; i < dstPoly->vertCount; ++i )
+  {
+    const int next = ( i + 1 ) % dstPoly->vertCount;
+    const float* dstA = &dstTile->verts[ dstPoly->verts[ i ] * 3 ];
+    const float* dstB = &dstTile->verts[ dstPoly->verts[ next ] * 3 ];
+
+    const bool sameDir = pointsNear2D( srcA, dstA, edgeMatchEps ) && pointsNear2D( srcB, dstB, edgeMatchEps );
+    const bool oppositeDir = pointsNear2D( srcA, dstB, edgeMatchEps ) && pointsNear2D( srcB, dstA, edgeMatchEps );
+    if( sameDir || oppositeDir )
+    {
+      dst.polyRef = src.neighborRef;
+      dst.edgeIndex = static_cast< uint8_t >( i );
+      dst.neighborRef = src.polyRef;
+      return true;
+    }
+  }
+
+  return false;
+}
+
+uint64_t ZoneEditor::makeBarrierEdgeKey( dtPolyRef polyRef, uint8_t edgeIndex ) const
+{
+  return ( static_cast< uint64_t >( polyRef ) << 8 ) | static_cast< uint64_t >( edgeIndex );
+}
+
+bool ZoneEditor::isBarrierEdge( dtPolyRef polyRef, uint8_t edgeIndex ) const
+{
+  return m_arenaBarrierEdgeKeys.count( makeBarrierEdgeKey( polyRef, edgeIndex ) ) > 0;
+}
+
+ZoneEditor::ArenaRegion ZoneEditor::floodFillRegion( dtPolyRef startPoly ) const
+{
+  ArenaRegion region;
+
+  if( !m_pNaviProvider )
+    return region;
+
+  const dtNavMesh* navMesh = m_pNaviProvider->getNavMesh();
+  if( !navMesh || startPoly == 0 )
+    return region;
+
+  std::queue< dtPolyRef > queue;
+  queue.push( startPoly );
+
+  while( !queue.empty() )
+  {
+    dtPolyRef currentRef = queue.front();
+    queue.pop();
+
+    if( region.visitedPolys.count( currentRef ) > 0 )
+      continue;
+
+    const dtMeshTile* tile = nullptr;
+    const dtPoly* poly = nullptr;
+    if( dtStatusFailed( navMesh->getTileAndPolyByRef( currentRef, &tile, &poly ) ) || !tile || !poly )
+      continue;
+
+    if( poly->getType() == DT_POLYTYPE_OFFMESH_CONNECTION )
+      continue;
+
+    region.visitedPolys.insert( currentRef );
+
+    for( int edgeIndex = 0; edgeIndex < poly->vertCount; ++edgeIndex )
+    {
+      if( isBarrierEdge( currentRef, static_cast< uint8_t >( edgeIndex ) ) )
+        continue;
+
+      for( uint32_t linkIndex = poly->firstLink; linkIndex != DT_NULL_LINK; linkIndex = tile->links[ linkIndex ].next )
+      {
+        const dtLink& link = tile->links[ linkIndex ];
+        if( link.edge != edgeIndex || link.ref == 0 )
+          continue;
+
+        const dtMeshTile* neighborTile = nullptr;
+        const dtPoly* neighborPoly = nullptr;
+        if( dtStatusFailed( navMesh->getTileAndPolyByRef( link.ref, &neighborTile, &neighborPoly ) ) || !neighborPoly )
+          continue;
+
+        if( neighborPoly->getType() == DT_POLYTYPE_OFFMESH_CONNECTION )
+          continue;
+
+        if( region.visitedPolys.count( link.ref ) == 0 )
+          queue.push( link.ref );
+      }
+    }
+  }
+
+  return region;
+}
+
+static float cross2D( const glm::vec2& a, const glm::vec2& b, const glm::vec2& c )
+{
+  return ( b.x - a.x ) * ( c.y - a.y ) - ( b.y - a.y ) * ( c.x - a.x );
+}
+
+std::vector< glm::vec2 > ZoneEditor::buildConvexHull2D( const std::vector< glm::vec2 >& points ) const
+{
+  if( points.size() < 3 )
+    return points;
+
+  std::vector< glm::vec2 > sorted = points;
+  std::sort( sorted.begin(), sorted.end(), []( const glm::vec2& a, const glm::vec2& b )
+  {
+    if( a.x == b.x )
+      return a.y < b.y;
+    return a.x < b.x;
+  } );
+
+  constexpr float eps = 0.0001f;
+  sorted.erase( std::unique( sorted.begin(), sorted.end(), [eps]( const glm::vec2& a, const glm::vec2& b )
+  {
+    return std::fabs( a.x - b.x ) <= eps && std::fabs( a.y - b.y ) <= eps;
+  } ), sorted.end() );
+
+  if( sorted.size() < 3 )
+    return sorted;
+
+  std::vector< glm::vec2 > hull;
+  hull.reserve( sorted.size() * 2 );
+
+  for( const auto& p : sorted )
+  {
+    while( hull.size() >= 2 && cross2D( hull[ hull.size() - 2 ], hull.back(), p ) <= 0.0f )
+      hull.pop_back();
+    hull.push_back( p );
+  }
+
+  const size_t lowerSize = hull.size();
+  for( int i = static_cast< int >( sorted.size() ) - 2; i >= 0; --i )
+  {
+    const auto& p = sorted[ i ];
+    while( hull.size() > lowerSize && cross2D( hull[ hull.size() - 2 ], hull.back(), p ) <= 0.0f )
+      hull.pop_back();
+    hull.push_back( p );
+  }
+
+  if( !hull.empty() )
+    hull.pop_back();
+
+  return hull;
+}
+
+static std::vector< glm::vec2 > clipPolygonByHalfPlane( const std::vector< glm::vec2 >& polygon,
+                                                         const glm::vec2& linePoint,
+                                                         const glm::vec2& inwardNormal )
+{
+  if( polygon.empty() )
+    return {};
+
+  auto inside = [&]( const glm::vec2& p )
+  {
+    return glm::dot( p - linePoint, inwardNormal ) >= 0.0f;
+  };
+
+  auto intersect = [&]( const glm::vec2& a, const glm::vec2& b )
+  {
+    const glm::vec2 ab = b - a;
+    const float da = glm::dot( a - linePoint, inwardNormal );
+    const float db = glm::dot( b - linePoint, inwardNormal );
+    const float denom = da - db;
+    if( std::fabs( denom ) <= 0.000001f )
+      return a;
+    const float t = da / denom;
+    return a + ab * t;
+  };
+
+  std::vector< glm::vec2 > output;
+  output.reserve( polygon.size() + 4 );
+
+  glm::vec2 prev = polygon.back();
+  bool prevInside = inside( prev );
+
+  for( const auto& cur : polygon )
+  {
+    const bool curInside = inside( cur );
+    if( prevInside && curInside )
+    {
+      output.push_back( cur );
+    }
+    else if( prevInside && !curInside )
+    {
+      output.push_back( intersect( prev, cur ) );
+    }
+    else if( !prevInside && curInside )
+    {
+      output.push_back( intersect( prev, cur ) );
+      output.push_back( cur );
+    }
+
+    prev = cur;
+    prevInside = curInside;
+  }
+
+  return output;
+}
+
+std::vector< glm::vec2 > ZoneEditor::clipHullBySelectedLines( const std::vector< glm::vec2 >& hull,
+                                                              const glm::vec2& anchorXZ,
+                                                              std::vector< std::string >& warnings ) const
+{
+  std::vector< glm::vec2 > clipped = hull;
+
+  for( auto collisionIndex : m_arenaSelectedCollisionIndices )
+  {
+    auto endpointsOpt = resolveLineEndpointsFromCollisionIndex( collisionIndex );
+    if( !endpointsOpt.has_value() )
+      continue;
+
+    const glm::vec2 a( endpointsOpt->first.x, endpointsOpt->first.z );
+    const glm::vec2 b( endpointsOpt->second.x, endpointsOpt->second.z );
+    const glm::vec2 d = b - a;
+    if( glm::dot( d, d ) <= 0.000001f )
+      continue;
+
+    glm::vec2 normalA( d.y, -d.x );
+    glm::vec2 normalB = -normalA;
+    glm::vec2 inwardNormal = glm::dot( anchorXZ - a, normalA ) >= 0.0f ? normalA : normalB;
+
+    auto newClipped = clipPolygonByHalfPlane( clipped, a, inwardNormal );
+    if( newClipped.size() < 3 )
+    {
+      warnings.push_back( fmt::format( "Line clip collapsed hull at collision #{}; keeping previous hull.", collisionIndex ) );
+      continue;
+    }
+
+    clipped = std::move( newClipped );
+  }
+
+  return clipped;
+}
+
+void ZoneEditor::buildHybridHullFromRegion( ArenaGenerationResult& result ) const
+{
+  if( !m_pNaviProvider )
+    return;
+
+  const dtNavMesh* navMesh = m_pNaviProvider->getNavMesh();
+  if( !navMesh || result.region.visitedPolys.empty() )
+    return;
+
+  std::vector< glm::vec2 > points2D;
+  points2D.reserve( result.region.visitedPolys.size() * 5 );
+
+  float minX = std::numeric_limits< float >::max();
+  float minY = std::numeric_limits< float >::max();
+  float minZ = std::numeric_limits< float >::max();
+  float maxX = std::numeric_limits< float >::lowest();
+  float maxY = std::numeric_limits< float >::lowest();
+  float maxZ = std::numeric_limits< float >::lowest();
+
+  for( auto polyRef : result.region.visitedPolys )
+  {
+    const dtMeshTile* tile = nullptr;
+    const dtPoly* poly = nullptr;
+    if( dtStatusFailed( navMesh->getTileAndPolyByRef( polyRef, &tile, &poly ) ) || !tile || !poly )
+      continue;
+
+    if( poly->getType() == DT_POLYTYPE_OFFMESH_CONNECTION )
+      continue;
+
+    for( int i = 0; i < poly->vertCount; ++i )
+    {
+      const float* v = &tile->verts[ poly->verts[ i ] * 3 ];
+      points2D.emplace_back( v[ 0 ], v[ 2 ] );
+      minX = std::min( minX, v[ 0 ] );
+      minY = std::min( minY, v[ 1 ] );
+      minZ = std::min( minZ, v[ 2 ] );
+      maxX = std::max( maxX, v[ 0 ] );
+      maxY = std::max( maxY, v[ 1 ] );
+      maxZ = std::max( maxZ, v[ 2 ] );
+    }
+  }
+
+  if( points2D.size() < 3 )
+    return;
+
+  if( m_objModel.loaded && !m_objModel.vertices.empty() )
+  {
+    const float xMin = minX - m_arenaHybridObjMarginXZ;
+    const float xMax = maxX + m_arenaHybridObjMarginXZ;
+    const float zMin = minZ - m_arenaHybridObjMarginXZ;
+    const float zMax = maxZ + m_arenaHybridObjMarginXZ;
+    const float yMin = m_arenaAnchor.y - m_arenaHybridObjYTolerance;
+    const float yMax = m_arenaAnchor.y + m_arenaHybridObjYTolerance;
+
+    for( const auto& vertex : m_objModel.vertices )
+    {
+      const glm::vec3& p = vertex.position;
+      if( p.x < xMin || p.x > xMax || p.z < zMin || p.z > zMax || p.y < yMin || p.y > yMax )
+        continue;
+
+      points2D.emplace_back( p.x, p.z );
+      minY = std::min( minY, p.y );
+      maxY = std::max( maxY, p.y );
+    }
+  }
+
+  auto hull = buildConvexHull2D( points2D );
+  if( hull.size() < 3 )
+  {
+    result.warnings.push_back( "Hybrid hull construction produced <3 vertices; using navmesh-only checks." );
+    return;
+  }
+
+  result.region.convexHull2D = std::move( hull );
+  result.region.clippedHull2D = clipHullBySelectedLines( result.region.convexHull2D,
+                                                          glm::vec2( result.anchor.x, result.anchor.z ),
+                                                          result.warnings );
+
+  if( result.region.clippedHull2D.size() < 3 )
+  {
+    result.warnings.push_back( "Clipped hull had <3 vertices; falling back to unclipped hybrid hull." );
+    result.region.clippedHull2D = result.region.convexHull2D;
+  }
+
+  if( minY <= maxY && std::isfinite( minY ) && std::isfinite( maxY ) )
+  {
+    result.region.hasYRange = true;
+    result.region.minY = minY;
+    result.region.maxY = maxY;
+  }
+}
+
+bool ZoneEditor::isPointInsideConvexPolygon2D( const std::vector< glm::vec2 >& polygon, const glm::vec2& point ) const
+{
+  if( polygon.size() < 3 )
+    return false;
+
+  bool hasPos = false;
+  bool hasNeg = false;
+
+  for( size_t i = 0; i < polygon.size(); ++i )
+  {
+    const glm::vec2& a = polygon[ i ];
+    const glm::vec2& b = polygon[ ( i + 1 ) % polygon.size() ];
+    const float c = cross2D( a, b, point );
+    hasPos = hasPos || c > 0.0001f;
+    hasNeg = hasNeg || c < -0.0001f;
+    if( hasPos && hasNeg )
+      return false;
+  }
+
+  return true;
+}
+
+bool ZoneEditor::isPointInsideArenaPolyfill( const glm::vec3& worldPos ) const
+{
+  if( !m_arenaResult.ok )
+    return false;
+
+  const auto& clippedHull = m_arenaResult.region.clippedHull2D;
+  if( clippedHull.size() >= 3 )
+  {
+    if( m_arenaUseYGate && m_arenaResult.region.hasYRange )
+    {
+      if( worldPos.y < m_arenaResult.region.minY || worldPos.y > m_arenaResult.region.maxY )
+        return false;
+    }
+
+    return isPointInsideConvexPolygon2D( clippedHull, glm::vec2( worldPos.x, worldPos.z ) );
+  }
+
+  if( m_arenaResult.region.visitedPolys.empty() )
+    return false;
+
+  if( !m_pNaviProvider || !m_pNaviProvider->getNavMesh() )
+    return false;
+
+  const float extents[ 3 ] = { m_arenaPolySnapExtentXZ, m_arenaPolySnapExtentY, m_arenaPolySnapExtentXZ };
+  auto polyRefOpt = findNearestPolyForPoint( worldPos, extents, nullptr );
+  if( !polyRefOpt.has_value() )
+    return false;
+
+  return m_arenaResult.region.visitedPolys.count( polyRefOpt.value() ) > 0;
+}
+
+uint64_t ZoneEditor::computeNavmeshFingerprint() const
+{
+  if( !m_pNaviProvider )
+    return 0;
+
+  const dtNavMesh* navMesh = m_pNaviProvider->getNavMesh();
+  if( !navMesh )
+    return 0;
+
+  uint64_t hash = 1469598103934665603ULL;
+  constexpr uint64_t prime = 1099511628211ULL;
+
+  for( int i = 0; i < navMesh->getMaxTiles(); ++i )
+  {
+    const dtMeshTile* tile = navMesh->getTile( i );
+    if( !tile || !tile->header || !tile->dataSize )
+      continue;
+
+    hash ^= static_cast< uint64_t >( tile->header->polyCount );
+    hash *= prime;
+    hash ^= static_cast< uint64_t >( tile->header->vertCount );
+    hash *= prime;
+    hash ^= static_cast< uint64_t >( tile->dataSize );
+    hash *= prime;
+  }
+
+  return hash;
+}
+
+ZoneEditor::ArenaGenerationResult ZoneEditor::generateArenaRegion()
+{
+  ArenaGenerationResult result;
+
+  if( !m_pNaviProvider || !m_pNaviProvider->getNavMesh() )
+  {
+    result.error = "No navmesh available for generation.";
+    return result;
+  }
+
+  if( !m_arenaAnchorSet )
+  {
+    result.error = "Anchor is not set. Use Pick Anchor first.";
+    return result;
+  }
+
+  if( m_arenaSelectedCollisionIndices.empty() )
+  {
+    result.error = "No collision boxes selected.";
+    return result;
+  }
+
+  float nearestExtents[ 3 ] = { m_arenaPolySnapExtentXZ, m_arenaPolySnapExtentY, m_arenaPolySnapExtentXZ };
+
+  auto startPolyOpt = findNearestPolyForPoint( m_arenaAnchor, nearestExtents, nullptr );
+  if( !startPolyOpt.has_value() )
+  {
+    result.error = "Unable to snap anchor to navmesh poly.";
+    return result;
+  }
+
+  m_arenaBarrierEdgeKeys.clear();
+  m_arenaBarrierEdges.clear();
+
+  result.anchor = m_arenaAnchor;
+  result.startPoly = startPolyOpt.value();
+  result.navmeshFingerprint = computeNavmeshFingerprint();
+
+  constexpr int sampleCount = 7;
+
+  for( auto collisionIndex : m_arenaSelectedCollisionIndices )
+  {
+    ArenaBarrierLine line;
+    line.collisionIndex = collisionIndex;
+
+    if( collisionIndex < 0 || collisionIndex >= static_cast< int >( m_cachedEObjCollisions.size() ) )
+      continue;
+
+    const auto& selectedCollision = m_cachedEObjCollisions[ collisionIndex ];
+    line.eobjInstanceId = selectedCollision.instanceId;
+    line.eobjBaseId = selectedCollision.baseId;
+
+    const auto endpointOpt = resolveLineEndpointsFromCollisionIndex( collisionIndex );
+    if( !endpointOpt.has_value() )
+    {
+      result.warnings.push_back( fmt::format( "Collision #{} could not be resolved as line.", collisionIndex ) );
+      continue;
+    }
+
+    line.pointA = endpointOpt->first;
+    line.pointB = endpointOpt->second;
+
+    for( int sampleIndex = 0; sampleIndex < sampleCount; ++sampleIndex )
+    {
+      const float t = sampleCount > 1 ? static_cast< float >( sampleIndex ) / static_cast< float >( sampleCount - 1 ) : 0.0f;
+      glm::vec3 samplePos = glm::mix( line.pointA, line.pointB, t );
+
+      auto polyOpt = findNearestPolyForPoint( samplePos, nearestExtents, nullptr );
+      if( !polyOpt.has_value() )
+        continue;
+
+      auto edgeOpt = findNearestEdgeOnPoly( polyOpt.value(), samplePos, m_arenaEdgeSnapMaxDistance );
+      if( !edgeOpt.has_value() )
+        continue;
+
+      const auto edge = edgeOpt.value();
+      const auto key = makeBarrierEdgeKey( edge.polyRef, edge.edgeIndex );
+      if( m_arenaBarrierEdgeKeys.insert( key ).second )
+      {
+        m_arenaBarrierEdges.push_back( edge );
+        line.mappedEdges.push_back( edge );
+      }
+
+      ArenaBarrierEdge twin;
+      if( expandBarrierToTwinEdge( edge, twin ) )
+      {
+        const auto twinKey = makeBarrierEdgeKey( twin.polyRef, twin.edgeIndex );
+        if( m_arenaBarrierEdgeKeys.insert( twinKey ).second )
+        {
+          m_arenaBarrierEdges.push_back( twin );
+        }
+      }
+    }
+
+    if( line.mappedEdges.empty() )
+      result.warnings.push_back( fmt::format( "No barrier edges matched for collision #{} (inst {}).",
+                                              collisionIndex, line.eobjInstanceId ) );
+
+    result.lines.push_back( line );
+  }
+
+  if( m_arenaBarrierEdgeKeys.empty() )
+  {
+    result.error = "No barrier edges were mapped from selected collision boxes.";
+    return result;
+  }
+
+  result.region = floodFillRegion( result.startPoly );
+  if( result.region.visitedPolys.empty() )
+  {
+    result.error = "Flood fill produced no polygons.";
+    return result;
+  }
+
+  buildHybridHullFromRegion( result );
+
+  result.ok = true;
+  return result;
+}
+
+bool ZoneEditor::exportArenaGenerationJson( const ArenaGenerationResult& result )
+{
+  if( !result.ok || !m_selectedZone )
+    return false;
+
+  std::error_code ec;
+  std::filesystem::path outputDir = std::filesystem::path( "tools" ) / "arena_bounds" /
+                                    std::to_string( m_selectedZone->id );
+  std::filesystem::create_directories( outputDir, ec );
+
+  if( ec )
+  {
+    printf( "[Arena] Failed to create export dir '%s': %s\n",
+            outputDir.string().c_str(), ec.message().c_str() );
+    return false;
+  }
+
+  std::filesystem::path outputFile = outputDir /
+                                     fmt::format( "{}_arena_bounds.json", m_selectedZone->name );
+
+  nlohmann::json root;
+  root[ "version" ] = 2;
+  root[ "mode" ] = "hybrid_hull_clipped";
+  root[ "territoryId" ] = m_selectedZone->id;
+  root[ "territoryName" ] = m_selectedZone->name;
+  root[ "anchor" ] = { result.anchor.x, result.anchor.y, result.anchor.z };
+  root[ "startPoly" ] = static_cast< uint64_t >( result.startPoly );
+  root[ "navmeshFingerprint" ] = result.navmeshFingerprint;
+  root[ "hybridParams" ] = {
+    { "objMarginXZ", m_arenaHybridObjMarginXZ },
+    { "objYTolerance", m_arenaHybridObjYTolerance },
+    { "useYGate", m_arenaUseYGate }
+  };
+
+  nlohmann::json lines = nlohmann::json::array();
+  for( const auto& line : result.lines )
+  {
+    nlohmann::json lineJson;
+    lineJson[ "instanceId" ] = line.eobjInstanceId;
+    lineJson[ "baseId" ] = line.eobjBaseId;
+    lineJson[ "collisionIndex" ] = line.collisionIndex;
+    lineJson[ "pointA" ] = { line.pointA.x, line.pointA.y, line.pointA.z };
+    lineJson[ "pointB" ] = { line.pointB.x, line.pointB.y, line.pointB.z };
+
+    nlohmann::json mapped = nlohmann::json::array();
+    for( const auto& edge : line.mappedEdges )
+    {
+      mapped.push_back( {
+        { "polyRef", static_cast< uint64_t >( edge.polyRef ) },
+        { "edgeIndex", edge.edgeIndex },
+        { "neighborRef", static_cast< uint64_t >( edge.neighborRef ) }
+      } );
+    }
+    lineJson[ "mappedEdges" ] = mapped;
+    lines.push_back( lineJson );
+  }
+  root[ "selectedLines" ] = lines;
+
+  nlohmann::json barrierEdges = nlohmann::json::array();
+  for( const auto& edge : m_arenaBarrierEdges )
+  {
+    barrierEdges.push_back( {
+      { "polyRef", static_cast< uint64_t >( edge.polyRef ) },
+      { "edgeIndex", edge.edgeIndex },
+      { "neighborRef", static_cast< uint64_t >( edge.neighborRef ) }
+    } );
+  }
+  root[ "barrierEdges" ] = barrierEdges;
+
+  nlohmann::json polyList = nlohmann::json::array();
+  for( auto polyRef : result.region.visitedPolys )
+    polyList.push_back( static_cast< uint64_t >( polyRef ) );
+  root[ "visitedPolys" ] = polyList;
+
+  nlohmann::json convexHull = nlohmann::json::array();
+  for( const auto& p : result.region.convexHull2D )
+    convexHull.push_back( { p.x, p.y } );
+  root[ "convexHull2D" ] = convexHull;
+
+  nlohmann::json clippedHull = nlohmann::json::array();
+  for( const auto& p : result.region.clippedHull2D )
+    clippedHull.push_back( { p.x, p.y } );
+  root[ "clippedHull2D" ] = clippedHull;
+
+  if( result.region.hasYRange )
+  {
+    root[ "yRange" ] = { result.region.minY, result.region.maxY };
+  }
+
+  root[ "warnings" ] = result.warnings;
+
+  std::ofstream out( outputFile );
+  if( !out.is_open() )
+    return false;
+
+  out << root.dump( 2 );
+  out.close();
+
+  m_arenaLastExportPath = outputFile.string();
+  return true;
+}
+
+void ZoneEditor::renderArenaOverlay( ImDrawList* drawList, const ImVec2& imagePos, const ImVec2& imageSize )
+{
+  if( !drawList )
+    return;
+
+  // Always show collision-box labels to improve general usability in the navmesh view.
+  // Selection is indicated via marker and highlight colors rather than hiding/showing names.
+  for( int collisionIndex = 0; collisionIndex < static_cast< int >( m_cachedEObjCollisions.size() ); ++collisionIndex )
+  {
+    const auto& collision = m_cachedEObjCollisions[ collisionIndex ];
+    if( collision.type != CachedEObjCollision::ShapeType::Box )
+      continue;
+
+    if( collision.width <= 0.0f || collision.height <= 0.0f || collision.depth <= 0.0f )
+      continue;
+
+    glm::vec2 centerScreen = worldTo3DScreen( collision.collPos, imageSize );
+    if( centerScreen.x < 0.0f || centerScreen.y < 0.0f )
+      continue;
+
+    const bool isSelected = m_arenaSelectedCollisionIndices.count( collisionIndex ) > 0;
+
+    std::string tag = fmt::format( "[{}] {}", collisionIndex, collision.eobjName );
+    ImVec2 textSize = ImGui::CalcTextSize( tag.c_str() );
+    ImVec2 textPos( imagePos.x + centerScreen.x - textSize.x * 0.5f,
+                    imagePos.y + centerScreen.y - textSize.y - 12.0f );
+
+    ImU32 bgColor = isSelected ? IM_COL32( 80, 50, 0, 210 ) : IM_COL32( 0, 0, 0, 150 );
+    ImU32 textColor = isSelected ? IM_COL32( 255, 220, 0, 255 ) : IM_COL32( 220, 220, 220, 230 );
+
+    drawList->AddRectFilled( ImVec2( textPos.x - 4.0f, textPos.y - 2.0f ),
+                             ImVec2( textPos.x + textSize.x + 4.0f, textPos.y + textSize.y + 2.0f ),
+                             bgColor, 3.0f );
+    drawList->AddText( textPos, textColor, tag.c_str() );
+
+    // Separate selection indicator so names can always stay visible.
+    if( isSelected )
+    {
+      ImVec2 marker( imagePos.x + centerScreen.x, imagePos.y + centerScreen.y );
+      drawList->AddCircleFilled( marker, 4.0f, IM_COL32( 255, 220, 0, 240 ) );
+      drawList->AddCircle( marker, 7.0f, IM_COL32( 255, 220, 0, 220 ), 0, 2.0f );
+    }
+  }
+
+  if( m_arenaAnchorSet )
+  {
+    glm::vec2 anchorScreen = worldTo3DScreen( m_arenaAnchor, imageSize );
+    if( anchorScreen.x >= 0.0f && anchorScreen.y >= 0.0f )
+    {
+      ImVec2 p( imagePos.x + anchorScreen.x, imagePos.y + anchorScreen.y );
+      drawList->AddCircle( p, 8.0f, IM_COL32( 0, 255, 255, 255 ), 0, 2.0f );
+      drawList->AddCircleFilled( p, 3.0f, IM_COL32( 0, 255, 255, 220 ) );
+    }
+  }
+
+  if( m_arenaShowBarrierOverlay )
+  {
+    for( auto collisionIndex : m_arenaSelectedCollisionIndices )
+    {
+      if( collisionIndex < 0 || collisionIndex >= static_cast< int >( m_cachedEObjCollisions.size() ) )
+        continue;
+
+      const auto& collision = m_cachedEObjCollisions[ collisionIndex ];
+
+      if( collision.type == CachedEObjCollision::ShapeType::Box &&
+          collision.width > 0.0f && collision.height > 0.0f && collision.depth > 0.0f )
+      {
+        const float hx = collision.width * 0.5f;
+        const float hy = collision.height * 0.5f;
+        const float hz = collision.depth * 0.5f;
+
+        std::array< glm::vec3, 8 > corners = {
+          glm::vec3( -hx, -hy, -hz ),
+          glm::vec3( hx, -hy, -hz ),
+          glm::vec3( hx, -hy, hz ),
+          glm::vec3( -hx, -hy, hz ),
+          glm::vec3( -hx, hy, -hz ),
+          glm::vec3( hx, hy, -hz ),
+          glm::vec3( hx, hy, hz ),
+          glm::vec3( -hx, hy, hz )
+        };
+
+        for( auto& corner : corners )
+          corner = rotY( corner, collision.collRot ) + collision.collPos;
+
+        std::array< std::pair< int, int >, 12 > edges = {
+          std::make_pair( 0, 1 ), std::make_pair( 1, 2 ), std::make_pair( 2, 3 ), std::make_pair( 3, 0 ),
+          std::make_pair( 4, 5 ), std::make_pair( 5, 6 ), std::make_pair( 6, 7 ), std::make_pair( 7, 4 ),
+          std::make_pair( 0, 4 ), std::make_pair( 1, 5 ), std::make_pair( 2, 6 ), std::make_pair( 3, 7 )
+        };
+
+        std::array< glm::vec2, 8 > projected{};
+        std::array< bool, 8 > visible{};
+        for( int i = 0; i < 8; ++i )
+        {
+          projected[ i ] = worldTo3DScreen( corners[ i ], imageSize );
+          visible[ i ] = projected[ i ].x >= 0.0f && projected[ i ].y >= 0.0f;
+        }
+
+        for( const auto& edge : edges )
+        {
+          if( !visible[ edge.first ] || !visible[ edge.second ] )
+            continue;
+
+          drawList->AddLine( ImVec2( imagePos.x + projected[ edge.first ].x, imagePos.y + projected[ edge.first ].y ),
+                             ImVec2( imagePos.x + projected[ edge.second ].x, imagePos.y + projected[ edge.second ].y ),
+                             IM_COL32( 255, 220, 0, 255 ), 2.0f );
+        }
+
+      }
+
+      auto endpointOpt = resolveLineEndpointsFromCollisionIndex( collisionIndex );
+      if( !endpointOpt.has_value() )
+        continue;
+
+      glm::vec2 a = worldTo3DScreen( endpointOpt->first, imageSize );
+      glm::vec2 b = worldTo3DScreen( endpointOpt->second, imageSize );
+      if( a.x < 0.0f || a.y < 0.0f || b.x < 0.0f || b.y < 0.0f )
+        continue;
+
+      drawList->AddLine( ImVec2( imagePos.x + a.x, imagePos.y + a.y ),
+                         ImVec2( imagePos.x + b.x, imagePos.y + b.y ),
+                         IM_COL32( 255, 120, 0, 255 ), 2.5f );
+    }
+  }
+
+  if( m_arenaResult.ok && m_arenaShowRegionOverlay )
+  {
+    if( m_pNaviProvider )
+    {
+      const dtNavMesh* navMesh = m_pNaviProvider->getNavMesh();
+      if( navMesh )
+      {
+        for( auto polyRef : m_arenaResult.region.visitedPolys )
+        {
+          const dtMeshTile* tile = nullptr;
+          const dtPoly* poly = nullptr;
+          if( dtStatusFailed( navMesh->getTileAndPolyByRef( polyRef, &tile, &poly ) ) || !tile || !poly )
+            continue;
+
+          if( poly->getType() == DT_POLYTYPE_OFFMESH_CONNECTION )
+            continue;
+
+          for( int i = 0; i < poly->vertCount; ++i )
+          {
+            const int next = ( i + 1 ) % poly->vertCount;
+            const float* va = &tile->verts[ poly->verts[ i ] * 3 ];
+            const float* vb = &tile->verts[ poly->verts[ next ] * 3 ];
+
+            glm::vec2 a = worldTo3DScreen( glm::vec3( va[ 0 ], va[ 1 ], va[ 2 ] ), imageSize );
+            glm::vec2 b = worldTo3DScreen( glm::vec3( vb[ 0 ], vb[ 1 ], vb[ 2 ] ), imageSize );
+            if( a.x < 0.0f || a.y < 0.0f || b.x < 0.0f || b.y < 0.0f )
+              continue;
+
+            drawList->AddLine( ImVec2( imagePos.x + a.x, imagePos.y + a.y ),
+                               ImVec2( imagePos.x + b.x, imagePos.y + b.y ),
+                               IM_COL32( 50, 220, 50, 255 ), 1.5f );
+          }
+        }
+      }
+    }
+
+    auto drawHull = [&]( const std::vector< glm::vec2 >& hull, ImU32 color, float thickness )
+    {
+      if( hull.size() < 2 )
+        return;
+
+      for( size_t i = 0; i < hull.size(); ++i )
+      {
+        const glm::vec2& a2 = hull[ i ];
+        const glm::vec2& b2 = hull[ ( i + 1 ) % hull.size() ];
+        glm::vec3 a3( a2.x, m_arenaAnchor.y, a2.y );
+        glm::vec3 b3( b2.x, m_arenaAnchor.y, b2.y );
+
+        glm::vec2 a = worldTo3DScreen( a3, imageSize );
+        glm::vec2 b = worldTo3DScreen( b3, imageSize );
+        if( a.x < 0.0f || a.y < 0.0f || b.x < 0.0f || b.y < 0.0f )
+          continue;
+
+        drawList->AddLine( ImVec2( imagePos.x + a.x, imagePos.y + a.y ),
+                           ImVec2( imagePos.x + b.x, imagePos.y + b.y ),
+                           color, thickness );
+      }
+    };
+
+    drawHull( m_arenaResult.region.convexHull2D, IM_COL32( 70, 180, 255, 255 ), 2.0f );
+    drawHull( m_arenaResult.region.clippedHull2D, IM_COL32( 255, 80, 80, 255 ), 2.6f );
   }
 }

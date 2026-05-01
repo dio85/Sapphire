@@ -33,7 +33,7 @@ using namespace Sapphire::Network::Packets;
 using namespace Sapphire::Network::Packets::WorldPackets::Server;
 
 void WarpMgr::requestMoveTerritory( Entity::Player& player, Common::WarpType warpType,
-                                    uint32_t targetTerritoryId, Common::FFXIVARR_POSITION3 targetPos, float targetRot )
+                                    uint32_t targetTerritoryId, Common::Vector3 targetPos, float targetRot )
 {
   auto& teriMgr = Common::Service< TerritoryMgr >::ref();
 
@@ -73,7 +73,7 @@ void WarpMgr::requestMoveTerritoryType( Entity::Player& player, Common::WarpType
 }
 
 void WarpMgr::requestMoveTerritoryType( Entity::Player& player, Common::WarpType warpType, uint32_t targetTerritoryTypeId,
-                                        Common::FFXIVARR_POSITION3 targetPos, float targetRot )
+                                        Common::Vector3 targetPos, float targetRot )
 {
   auto& teriMgr = Common::Service< TerritoryMgr >::ref();
 
@@ -87,7 +87,7 @@ void WarpMgr::requestMoveTerritoryType( Entity::Player& player, Common::WarpType
   requestMoveTerritory( player, warpType, pTeri->getGuId(), player.getPos(), player.getRot() );
 }
 
-void WarpMgr::requestWarp( Entity::Player& player, Common::WarpType warpType, Common::FFXIVARR_POSITION3 targetPos, float targetRot )
+void WarpMgr::requestWarp( Entity::Player& player, Common::WarpType warpType, Common::Vector3 targetPos, float targetRot )
 {
   m_entityIdToWarpInfoMap[ player.getId() ] = { 0, warpType, targetPos, targetRot };
 
@@ -155,6 +155,10 @@ void WarpMgr::requestPlayerTeleport( Entity::Player& player, uint16_t aetheryteI
     auto land = player.getCharaLandData( Common::LandFlagsSlot::Private );
     int housingIndex = teriMgr.getHousingIndex( data.TerritoryType );
     auto info = exdData.getRow< Excel::HousingLandSet >( housingIndex );
+
+    if( !info )
+      return;
+
     auto landInfo = info->_data.Lands[ land.landId.landId ];
     popRange = landInfo.ExitPopRange;
   }
@@ -162,7 +166,7 @@ void WarpMgr::requestPlayerTeleport( Entity::Player& player, uint16_t aetheryteI
   auto& instanceObjectCache = Common::Service< InstanceObjectCache >::ref();
   auto pop = instanceObjectCache.getPopRangeInfo( popRange );
 
-  Common::FFXIVARR_POSITION3 pos{ 0.f, 0.f, 0.f };
+  Common::Vector3 pos{ 0.f, 0.f, 0.f };
 
   float rot = 0.f;
 
@@ -179,11 +183,11 @@ void WarpMgr::requestPlayerTeleport( Entity::Player& player, uint16_t aetheryteI
 
   auto townPlace = exdData.getRow< Excel::PlaceName >( data.TelepoName );
   auto aetherytePlace = exdData.getRow< Excel::PlaceName >( data.TransferName );
-
-  PlayerMgr::sendDebug( player, "Teleport: {0} - {1} ({2})",
-                        townPlace->getString( townPlace->data().Text.SGL ),
-                        aetherytePlace->getString( aetherytePlace->data().Text.SGL ),
-                        data.TerritoryType );
+  if( townPlace && aetherytePlace )
+    PlayerMgr::sendDebug( player, "Teleport: {0} - {1} ({2})",
+                          townPlace->getString( townPlace->data().Text.SGL ),
+                          aetherytePlace->getString( aetherytePlace->data().Text.SGL ),
+                          data.TerritoryType );
 
   // if it is a teleport in the same zone, we want to do warp instead of moveTerri
   bool sameTerritory = player.getTerritoryTypeId() == data.TerritoryType;

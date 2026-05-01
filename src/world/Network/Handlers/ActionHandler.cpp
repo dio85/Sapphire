@@ -26,7 +26,7 @@ void Sapphire::Network::GameConnection::actionRequest( const Packets::FFXIVARR_P
   const auto requestId = packet.data().RequestId;
   const auto targetId = packet.data().Target;
   const auto itemSourceSlot = packet.data().Arg & 0x0000FFFF;
-  const auto itemSourceContainer = packet.data().Arg & 0xFFFF0000;
+  const auto itemSourceContainer = static_cast< uint16_t >( ( packet.data().Arg >> 16 ) & 0xFFFF );
 
   PlayerMgr::sendDebug( player, "Skill type: {0}, requestId: {1}, actionId: {2}, targetId: {3}", type, requestId, actionId, targetId );
 
@@ -77,7 +77,9 @@ void Sapphire::Network::GameConnection::actionRequest( const Packets::FFXIVARR_P
     case Common::ActionKind::ACTION_KIND_EVENT_ITEM:
     {
       auto action = exdData.getRow< Excel::EventItem >( actionId );
-      assert( action );
+      if( !action )
+        return;
+      
       actionMgr.handleEventItemAction( player, actionId, action, requestId, targetId );
       break;
     }
@@ -85,7 +87,9 @@ void Sapphire::Network::GameConnection::actionRequest( const Packets::FFXIVARR_P
     case Common::ActionKind::ACTION_KIND_MOUNT:
     {
       auto action = exdData.getRow< Excel::Action >( 4 );
-      assert( action );
+      if( !action )
+        return;
+
       actionMgr.handleMountAction( player, static_cast< uint16_t >( actionId ), action, targetId, requestId );
       break;
     }
@@ -126,7 +130,7 @@ void Sapphire::Network::GameConnection::selectGroundActionRequest( const Packets
       PlayerMgr::sendDebug( player, "Skill type: {0}, requestId: {1}, actionId: {2}, x:{3}, y:{4}, z:{5}",
                             type, requestId, actionId, pos.x, pos.y, pos.z );
 
-      Common::FFXIVARR_POSITION3 targetPos = { pos.x, pos.y, pos.z };
+      Common::Vector3 targetPos = { pos.x, pos.y, pos.z };
       auto action = exdData.getRow< Excel::EventItem >( actionId );
       assert( action );
       actionMgr.handlePlacedEventItemAction( player, actionId, action, requestId, targetPos );

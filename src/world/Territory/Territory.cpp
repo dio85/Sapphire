@@ -77,7 +77,6 @@ void Territory::loadServerPaths()
   // Check if JSON file exists
   if( !std::filesystem::exists( jsonPath ) )
   {
-    Logger::debug( "No paths JSON file found for zone: {}", m_internalName );
     return;
   }
 
@@ -142,7 +141,7 @@ void Territory::loadServerPaths()
     }
 
     Logger::info( "Loaded {} server paths for zone: {}", m_serverPathCache.size(), m_internalName );
-  } catch( std::runtime_error& e )
+  } catch( std::exception& e )
   {
     Logger::error( "Error loading paths from JSON {}: {}", jsonPath, e.what() );
   }
@@ -187,12 +186,17 @@ void Territory::loadWeatherRates()
 
   auto& exdData = Common::Service< Data::ExdData >::ref();
 
-  uint8_t weatherRateId = m_territoryTypeInfo->data().WeatherRate > exdData.getIdList< Excel::WeatherRate >().size()
-                            ? uint8_t{ 0 }
-                            : m_territoryTypeInfo->data().WeatherRate;
+  uint8_t weatherRateId = m_territoryTypeInfo->data().WeatherRate;
+  auto weatherRate = exdData.getRow< Excel::WeatherRate >( weatherRateId );
+  if( !weatherRate )
+  {
+    weatherRateId = 0;
+    weatherRate = exdData.getRow< Excel::WeatherRate >( weatherRateId );
+    if( !weatherRate )
+      return;
+  }
 
   uint8_t sumPc = 0;
-  auto weatherRate = exdData.getRow< Excel::WeatherRate >( weatherRateId );
   for( size_t i = 0; i < 8; ++i )
   {
     int32_t weatherId = weatherRate->data().WeatherId[ i ];
@@ -209,6 +213,7 @@ Territory::~Territory() = default;
 
 bool Territory::init()
 {
+  const auto startMs = Common::Util::getTimeMs();
   auto& scriptMgr = Common::Service< Scripting::ScriptMgr >::ref();
 
   if( scriptMgr.onZoneInit( *this ) )
@@ -226,6 +231,12 @@ bool Territory::init()
   if( !m_pNaviProvider )
   {
     Logger::warn( "No navmesh found for TerritoryType#{}", getTerritoryTypeId() );
+  }
+
+  const auto elapsedMs = Common::Util::getTimeMs() - startMs;
+  if( elapsedMs >= 25 )
+  {
+    Logger::debug( "Territory::init TerritoryType#{} GuId#{} took {}ms", getTerritoryTypeId(), getGuId(), elapsedMs );
   }
 
   return true;
@@ -311,8 +322,9 @@ void Territory::pushActor( const Entity::GameObjectPtr& pActor )
   uint32_t cellX = getPosX( pActor->getPos().x );
   uint32_t cellY = getPosY( pActor->getPos().z );
 
-  uint32_t endX = cellX <= _sizeX ? cellX + 1 : ( _sizeX - 1 );
-  uint32_t endY = cellY <= _sizeY ? cellY + 1 : ( _sizeY - 1 );
+  uint32_t endX = ( cellX + 1 < _sizeX ) ? cellX + 1 : ( _sizeX - 1 );
+  uint32_t endY = ( cellY + 1 < _sizeY ) ? cellY + 1 : ( _sizeY - 1 );
+
   uint32_t startX = cellX > 0 ? cellX - 1 : 0;
   uint32_t startY = cellY > 0 ? cellY - 1 : 0;
   uint32_t posX, posY;
@@ -333,9 +345,9 @@ void Territory::pushActor( const Entity::GameObjectPtr& pActor )
   {
     auto pPlayer = pActor->getAsPlayer();
 
-    if( m_pNaviProvider )
-      agentId = m_pNaviProvider->addAgent( pPlayer->getPos(), pPlayer->getRadius() );
-    pPlayer->setAgentId( agentId );
+    //if( m_pNaviProvider )
+    //  agentId = m_pNaviProvider->addAgent( pPlayer->getPos(), pPlayer->getRadius() );
+    //pPlayer->setAgentId( agentId );
 
     m_playerMap[ pPlayer->getId() ] = pPlayer;
     updateCellActivity( cx, cy, 1 );
@@ -374,6 +386,8 @@ void Territory::pushActor( const Entity::GameObjectPtr& pActor )
     else
       m_bNpcAreaObjects[ pArea->getOwnerId() ] = pArea;
   }
+  pActor->setTerritoryId( getGuId() );
+  pActor->setTerritoryTypeId( getTerritoryTypeId() );
 }
 
 void Territory::removeActor( const Entity::GameObjectPtr& pActor )
@@ -584,7 +598,7 @@ bool Territory::update( uint64_t tickCount )
   auto dt = static_cast< float >( std::difftime( tickCount, m_lastUpdate ) / 1000.f );
 
   if( m_pNaviProvider )
-    m_pNaviProvider->updateCrowd( dt );
+    m_pNaviProvider->update( dt );
 
   updateSessions( tickCount, changedWeather );
   onUpdate( tickCount );
@@ -608,14 +622,14 @@ void Territory::updateSessions( uint64_t tickCount, bool changedWeather )
 {
   auto& server = Common::Service< World::WorldServer >::ref();
   // update sessions in this zone
-  for( auto it = m_playerMap.begin(); it != m_playerMap.end(); ++it )
+  for( auto it = m_playerMap.begin(); it != m_playerMap.end(); )
   {
     auto pPlayer = it->second;
 
     if( !pPlayer )
     {
-      m_playerMap.erase( it );
-      return;
+      it = m_playerMap.erase( it );
+      continue;
     }
 
     // this session is not linked to this area anymore, remove it from zone session list
@@ -644,13 +658,16 @@ void Territory::updateSessions( uint64_t tickCount, bool changedWeather )
     // this session is not linked to this area anymore, remove it from zone session list
     if( pPlayer->getTerritoryId() != getGuId() )
       return;
+
+    ++it;
   }
 }
 
 bool Territory::isCellActive( uint32_t x, uint32_t y )
 {
-  uint32_t endX = ( ( x + 1 ) <= _sizeX ) ? x + 1 : ( _sizeX - 1 );
-  uint32_t endY = ( ( y + 1 ) <= _sizeY ) ? y + 1 : ( _sizeY - 1 );
+  uint32_t endX = ( x + 1 < _sizeX ) ? x + 1 : ( _sizeX - 1 );
+  uint32_t endY = ( y + 1 < _sizeY ) ? y + 1 : ( _sizeY - 1 );
+
   uint32_t startX = x > 0 ? x - 1 : 0;
   uint32_t startY = y > 0 ? y - 1 : 0;
   uint32_t posX;
@@ -675,8 +692,9 @@ bool Territory::isCellActive( uint32_t x, uint32_t y )
 
 void Territory::updateCellActivity( uint32_t x, uint32_t y, int32_t radius )
 {
-  uint32_t endX = ( x + radius ) <= _sizeX ? x + radius : ( _sizeX - 1 );
-  uint32_t endY = ( y + radius ) <= _sizeY ? y + radius : ( _sizeY - 1 );
+  uint32_t endX = ( x + radius < _sizeX ) ? x + radius : ( _sizeX - 1 );
+  uint32_t endY = ( y + radius < _sizeY ) ? y + radius : ( _sizeY - 1 );
+    
   uint32_t startX = x - radius > 0 ? x - radius : 0;
   uint32_t startY = y - radius > 0 ? y - radius : 0;
   uint32_t posX, posY;
@@ -765,8 +783,9 @@ void Territory::updateActorPosition( Entity::GameObject& actor )
   }
 
   // update in range actor set
-  uint32_t endX = cellX <= _sizeX ? cellX + 1 : ( _sizeX - 1 );
-  uint32_t endY = cellY <= _sizeY ? cellY + 1 : ( _sizeY - 1 );
+  uint32_t endX = ( cellX + 1 < _sizeX ) ? cellX + 1 : ( _sizeX - 1 );
+  uint32_t endY = ( cellY + 1 < _sizeY ) ? cellY + 1 : ( _sizeY - 1 );
+
   uint32_t startX = cellX > 0 ? cellX - 1 : 0;
   uint32_t startY = cellY > 0 ? cellY - 1 : 0;
   uint32_t posX, posY;
@@ -887,6 +906,23 @@ Entity::EventObjectPtr Territory::getEObj( uint32_t objId )
   return obj->second;
 }
 
+Entity::EventObjectPtr Territory::getEObjByBaseId( uint32_t baseId )
+{
+  for( const auto& obj : m_eventObjects )
+    if( obj.second->getBaseId() == baseId )
+      return obj.second;
+  return nullptr;
+}
+
+Entity::EventObjectPtr Territory::getEObjByName(const std::string& name)
+{
+  for( const auto& obj : m_eventObjects )
+    if( obj.second->getName() == name )
+      return obj.second;
+
+  return nullptr;
+}
+
 Entity::PlayerPtr Territory::getPlayer( uint32_t playerId )
 {
   if( auto it = m_playerMap.find( playerId ); it != m_playerMap.end() )
@@ -921,7 +957,7 @@ uint32_t Territory::getNextActorId()
 
 Entity::EventObjectPtr Territory::addEObj( const std::string& name, uint32_t baseId, uint32_t boundInstanceId,
                                            uint32_t instanceId,
-                                           uint8_t state, Common::FFXIVARR_POSITION3 pos, float scale,
+                                           uint8_t state, Common::Vector3 pos, float scale,
                                            float rotation, uint8_t permissionInv )
 {
   auto eObj = Entity::make_EventObject( getNextEObjId(), baseId, boundInstanceId, instanceId, state, pos, rotation, name,
@@ -965,6 +1001,11 @@ uint32_t Territory::getNextActionResultId()
   return m_effectCounter++;
 }
 
+uint32_t Territory::getNextEncounterId()
+{
+  return m_nextEncounterId++;
+}
+
 Entity::BNpcPtr Territory::createBNpcFromLayoutId( uint32_t layoutId, uint32_t hp, Common::BNpcType bnpcType,
                                                    uint32_t triggerOwnerId )
 {
@@ -990,6 +1031,25 @@ Entity::BNpcPtr Territory::createBNpcFromLayoutIdNoPush( uint32_t layoutId, uint
   pBNpc->init();
   pBNpc->setTriggerOwnerId( triggerOwnerId );
   return pBNpc;
+}
+
+Entity::GameObjectPtr Territory::getEntityById( uint32_t entityId )
+{
+  Entity::GameObjectPtr pRet = nullptr;
+
+  pRet = getPlayer( entityId );
+  if( pRet )
+    return pRet;
+
+  pRet = getActiveBNpcByEntityId( entityId );
+  if( pRet )
+    return pRet;
+
+  pRet = getEObj( entityId );
+  if( pRet )
+    return pRet;
+
+  return pRet;
 }
 
 Entity::BNpcPtr Territory::getActiveBNpcByEntityId( uint32_t entityId )
@@ -1034,7 +1094,6 @@ bool Territory::loadBNpcs()
   // Check if JSON file exists
   if( !std::filesystem::exists( jsonPath ) )
   {
-    Logger::debug( "No BNPC JSON file found for zone: {}", m_internalName );
     return true; // Not an error, just no BNPCs for this zone
   }
 

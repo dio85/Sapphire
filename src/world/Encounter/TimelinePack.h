@@ -41,6 +41,7 @@ namespace Sapphire
     
     uint64_t m_startTime{ 0 };
     std::shared_ptr< Encounter > m_pEncounter;
+    std::map< uint32_t, uint64_t > m_vars;
 
   public:
     TimelinePack() {}
@@ -61,7 +62,7 @@ namespace Sapphire
 
     void addSelector( const std::string& name, const Selector& selector );
 
-    void createSnapshot( const std::string& selectorName, Entity::CharaPtr pSrc,
+    void createSnapshot( const std::string& selectorName, Entity::Chara& src,
                          const std::vector< uint32_t >& exclude );
 
     const World::AI::Snapshot::Results& getSnapshotResults( const std::string& selectorName );
@@ -75,24 +76,27 @@ namespace Sapphire
 
     void reset( EncounterPtr pEncounter );
 
+    void spawnAllSubActors( EncounterPtr pEncounter );
+
     void setStartTime( uint64_t time );
 
     uint64_t getStartTime() const;
 
     void update( uint64_t time );
 
-    bool isScheduleActive( const std::string& actorRef, const std::string& scheduleName );
+    bool isPhaseActive( const std::string& actorRef, uint32_t phaseId );
 
-    void resetConditionState( uint32_t id, bool toDefault = false );
-
-    void setConditionStateEnabled( uint32_t id, bool enabled );
+    void setTriggerEnabled( const std::string& actorRef, uint32_t phaseId, uint32_t triggerId, bool enabled );
 
     bool valid();
 
     void setEncounter( std::shared_ptr< Encounter > pEncounter );
 
+    uint32_t getVar( uint32_t index ) const;
+
+    void setVar( uint32_t index, uint32_t val );
+
     static TimeLinePackPtr createTimelinePack( const std::string& name );
-    static TimelinePack getEncounterPack( const std::string& name, bool reload = false );
   };
 
 

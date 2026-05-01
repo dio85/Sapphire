@@ -41,7 +41,8 @@ namespace Sapphire::World::AI
       AllianceB,
       AllianceC,
 
-      IsDead
+      IsDead,
+      SameEncounter
     };
 
   protected:
@@ -242,6 +243,18 @@ namespace Sapphire::World::AI
       TargetSelectFilter( Type::IsDead )
     {
     }
+
+    bool isApplicable( Entity::CharaPtr& pSrc, Entity::CharaPtr& pTarget ) const override;
+  };
+
+  class SameEncounterFilter : public TargetSelectFilter
+  {
+  public:
+    SameEncounterFilter() :
+      TargetSelectFilter( Type::SameEncounter )
+    {
+    }
+
     bool isApplicable( Entity::CharaPtr& pSrc, Entity::CharaPtr& pTarget ) const override;
   };
 
@@ -255,7 +268,7 @@ namespace Sapphire::World::AI
     struct CharaEntry
     {
       uint32_t m_entityId;
-      Common::FFXIVARR_POSITION3 m_pos;
+      Common::Vector3 m_pos;
       float m_rot;
       // todo: status effects?
     };
@@ -268,7 +281,7 @@ namespace Sapphire::World::AI
   public:
     Snapshot() {}
 
-    void createSnapshot( Entity::CharaPtr pSrc, const std::set< Entity::GameObjectPtr >& inRange,
+    void createSnapshot( Entity::Chara& src, const std::set< Entity::GameObjectPtr >& inRange,
                          uint32_t count, bool fillWithRandom,
                          const std::vector< TargetSelectFilterPtr >& filters,
                          const std::vector< uint32_t >& exclude = {} );

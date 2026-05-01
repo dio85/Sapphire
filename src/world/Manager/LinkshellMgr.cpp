@@ -36,6 +36,8 @@ bool LinkshellMgr::loadLinkshells()
 
   auto query = db.getPreparedStatement( Db::LINKSHELL_SEL_ALL );
   auto res = db.query( query );
+  if( !res )
+    return false;
 
   while( res->next() )
   {
@@ -96,6 +98,7 @@ void LinkshellMgr::writeLinkshell( uint64_t lsId )
   if( !ls )
   {
     Logger::error( "Linkshell {} not found for write!", lsId );
+    return;
   }
 
   auto query = db.getPreparedStatement( Db::LINKSHELL_UP );

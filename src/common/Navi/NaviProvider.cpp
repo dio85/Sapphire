@@ -3,6 +3,7 @@
 
 #include <Random/RNGMgr.h>
 
+#include "NavMeshCacheIO.h"
 #include "NaviProvider.h"
 
 #include <recastnavigation/Detour/Include/DetourNavMesh.h>
@@ -10,6 +11,7 @@
 #include <DetourCommon.h>
 #include <recastnavigation/Recast/Include/Recast.h>
 #include <filesystem>
+#include <fstream>
 #include <Service.h>
 
 Sapphire::Common::Navi::NaviProvider::NaviProvider( const std::string& internalName ) :
@@ -254,8 +256,8 @@ static float frand()
 }
 
 
-Sapphire::Common::FFXIVARR_POSITION3
-  Sapphire::Common::Navi::NaviProvider::findRandomPositionInCircle( const Sapphire::Common::FFXIVARR_POSITION3& startPos,
+Sapphire::Common::Vector3
+  Sapphire::Common::Navi::NaviProvider::findRandomPositionInCircle( const Sapphire::Common::Vector3& startPos,
                                                                    float maxRadius )
 {
   dtStatus status;
@@ -304,7 +306,7 @@ Sapphire::Common::FFXIVARR_POSITION3
 
 
 
-Sapphire::Common::FFXIVARR_POSITION3
+Sapphire::Common::Vector3
   Sapphire::Common::Navi::NaviProvider::findNearestPosition( float x, float z )
 {
   dtStatus status;
@@ -349,14 +351,14 @@ Sapphire::Common::FFXIVARR_POSITION3
   return { snearest[ 0 ], snearest[ 1 ], snearest[ 2 ] };
 }
 
-std::vector< Sapphire::Common::FFXIVARR_POSITION3 >
-  Sapphire::Common::Navi::NaviProvider::findFollowPath( const Common::FFXIVARR_POSITION3& startPos,
-                                                       const Common::FFXIVARR_POSITION3& endPos )
+std::vector< Sapphire::Common::Vector3 >
+  Sapphire::Common::Navi::NaviProvider::findFollowPath( const Common::Vector3& startPos,
+                                                       const Common::Vector3& endPos )
 {
   if( !m_naviMesh || !m_naviMeshQuery )
     throw std::runtime_error( "No navimesh loaded" );
 
-  auto resultCoords = std::vector< Common::FFXIVARR_POSITION3 >();
+  auto resultCoords = std::vector< Common::Vector3 >();
 
   dtPolyRef startRef, endRef = 0;
 
@@ -510,7 +512,7 @@ std::vector< Sapphire::Common::FFXIVARR_POSITION3 >
 
     for( int32_t i = 0; i < numSmoothPath; i += 3 )
     {
-      resultCoords.emplace_back( Common::FFXIVARR_POSITION3{ smoothPath[ i ], smoothPath[ i + 1 ], smoothPath[ i + 2 ] } );
+      resultCoords.emplace_back( Common::Vector3{ smoothPath[ i ], smoothPath[ i + 1 ], smoothPath[ i + 2 ] } );
     }
   }
 
@@ -519,100 +521,166 @@ std::vector< Sapphire::Common::FFXIVARR_POSITION3 >
 
 bool Sapphire::Common::Navi::NaviProvider::loadMesh( const std::string& path )
 {
-  FILE* fp = fopen( path.c_str(), "rb" );
-  if( !fp )
+  std::ifstream fp( path, std::ios::binary );
+  if( !fp.is_open() )
   {
     Logger::error( "Couldn't open navimesh file: {0}", path );
     return false;
   }
 
   // Read header.
-  NavMeshSetHeader header;
-
-  size_t readLen = fread( &header, sizeof( NavMeshSetHeader ), 1, fp );
-  if( readLen != 1 )
+  TileCacheSetHeader header;
+  fp.read( reinterpret_cast<char*>( &header ), sizeof( TileCacheSetHeader ) );
+  if( !fp || header.magic != TILECACHESET_MAGIC || header.version != TILECACHESET_VERSION )
   {
-    fclose( fp );
-    Logger::error( "Couldn't read NavMeshSetHeader for {0}", path );
     return false;
   }
 
-  if( header.magic != NAVMESHSET_MAGIC )
-  {
-    fclose( fp );
-    Logger::error( "'{0}' has an incorrect NavMeshSet header.", path );
-    return false;
-  }
-
-  if( header.version != NAVMESHSET_VERSION )
-  {
-    fclose( fp );
-    Logger::error( "'{0}' has an incorrect NavMeshSet version. Expected '{1}', got '{2}'", path, NAVMESHSET_VERSION, header.version );
-    return false;
-  }
-
+  m_naviMesh = dtAllocNavMesh();
   if( !m_naviMesh )
   {
+    return false;
+  }
+  
+  dtStatus status = m_naviMesh->init( &header.meshParams );
+  if( dtStatusFailed( status ) )
+  {
+    return false;
+  }
+
+  m_tileCache = dtAllocTileCache();
+  if( !m_tileCache )
+  {
+    return false;
+  }
+  if( m_talloc )
+    delete m_talloc;
+  if( m_tcomp )
+    delete m_tcomp;
+  if( m_tmproc )
+    delete m_tmproc;
+
+  m_talloc = new LinearAllocator( 32000 );
+  m_tcomp = new FastLZCompressor();
+  m_tmproc = new MeshProcess();
+
+  status = m_tileCache->init( &header.cacheParams, m_talloc, m_tcomp, m_tmproc );
+  if( dtStatusFailed( status ) )
+  {
+    Logger::error( "dtTileCache::init failed with status {:#x} for zone {}", status, path );
+    dtFreeTileCache( m_tileCache );
+    m_tileCache = nullptr;
+    return false;
+  }
+
+  auto resetNavMesh = [ this, &header, &path ]() -> bool
+  {
+    if( m_naviMesh )
+    {
+      dtFreeNavMesh( m_naviMesh );
+      m_naviMesh = nullptr;
+    }
+
     m_naviMesh = dtAllocNavMesh();
     if( !m_naviMesh )
     {
-      fclose( fp );
-      Logger::error( "Couldn't allocate dtNavMesh" );
+      Logger::error( "Unable to allocate navmesh while resetting cache load for {0}", path );
       return false;
     }
 
-    dtStatus status = m_naviMesh->init( &header.params );
-    if( dtStatusFailed( status ) )
+    dtStatus resetStatus = m_naviMesh->init( &header.meshParams );
+    if( dtStatusFailed( resetStatus ) )
     {
-      fclose( fp );
-      Logger::error( "Couldn't initialise dtNavMesh" );
+      Logger::error( "Unable to reinitialize navmesh while resetting cache load for {0}", path );
       return false;
+    }
+
+    return true;
+  };
+
+  bool loadedFromCache = false;
+  // todo: allow nav cache to be optional from config.ini??? unsure
+  const std::filesystem::path navPath( path );
+  const std::filesystem::path cachePath = getNavMeshCachePath( navPath );
+
+  if( isNavMeshCacheFresh( navPath, cachePath ) )
+  {
+    std::string cacheError;
+    if( loadNavMeshCache( cachePath, m_naviMesh, &cacheError ) )
+    {
+      loadedFromCache = true;
+      Logger::info( "Loaded navmesh from fast-cache for {}", path );
+    }
+    else
+    {
+      Logger::warn( "Rejected navmesh cache {}: {}", cachePath.string(), cacheError );
+      if( !resetNavMesh() )
+      {
+        return false;
+      }
     }
   }
 
-  // Read tiles.
-  for( int32_t i = 0; i < header.numTiles; ++i )
-  {
-    NavMeshTileHeader tileHeader;
-    readLen = fread( &tileHeader, sizeof( tileHeader ), 1, fp );
-    if( readLen != 1 )
-    {
-      fclose( fp );
-      Logger::error( "Couldn't read NavMeshTileHeader from '{0}'", path );
-      return false;
-    }
+  const bool rebuildNavMesh = !loadedFromCache;
 
+  // Read tiles.
+  for( int i = 0; i < header.numTiles; ++i )
+  {
+    TileCacheTileHeader tileHeader;
+    fp.read( reinterpret_cast<char*>( &tileHeader ), sizeof( tileHeader ) );
+    if( !fp )
+    {
+      return false; // eof or navmesh is porked as hell
+    }
     if( !tileHeader.tileRef || !tileHeader.dataSize )
       break;
 
-    auto data = reinterpret_cast< uint8_t* >( dtAlloc( tileHeader.dataSize, DT_ALLOC_PERM ) );
-    if( !data )
-      break;
+    auto* data = static_cast< unsigned char* >( dtAlloc( tileHeader.dataSize, DT_ALLOC_PERM ) );
+    if( !data ) break;
     memset( data, 0, tileHeader.dataSize );
-    readLen = fread( data, tileHeader.dataSize, 1, fp );
-    if( readLen != 1 )
+    fp.read( reinterpret_cast< char* >( data ), tileHeader.dataSize );
+    if( !fp )
     {
       dtFree( data );
-      fclose( fp );
-
-      Logger::error( "Couldn't read tile data from '{0}'", path );
       return false;
     }
 
-    m_naviMesh->addTile( data, tileHeader.dataSize, DT_TILE_FREE_DATA, tileHeader.tileRef, 0 );
+    dtCompressedTileRef tile = 0;
+    dtStatus addTileStatus = m_tileCache->addTile( data, tileHeader.dataSize, DT_COMPRESSEDTILE_FREE_DATA, &tile );
+    if( dtStatusFailed( addTileStatus ) )
+    {
+      Logger::error( "[Navmesh] Unable to add tile to cache for {0}", path );
+      dtFree( data );
+    }
+
+    if( tile && rebuildNavMesh )
+      m_tileCache->buildNavMeshTile( tile, m_naviMesh );
   }
 
-  fclose( fp );
+  fp.close();
+
+  if( rebuildNavMesh )
+  {
+    std::string cacheError;
+    if( writeNavMeshCache( cachePath, m_naviMesh, &cacheError ) )
+    {
+      Logger::info( "Created fast-cache navmesh for {}", path );
+    }
+    else
+    {
+      Logger::warn( "Unable to write fast-cache navmesh for {}: {}", path, cacheError );
+    }
+  }
 
   return true;
 }
 
-int32_t Sapphire::Common::Navi::NaviProvider::addAgent( const Common::FFXIVARR_POSITION3& pos, float radius, float speed )
+int32_t Sapphire::Common::Navi::NaviProvider::addAgent( const Common::Vector3& pos, float radius, float speed )
 {
   dtCrowdAgentParams params{};
   std::memset( &params, 0, sizeof( params ) );
   params.height = 3.f;
-  params.maxAcceleration = 10.f;
+  params.maxAcceleration = 40.f;
   params.maxSpeed = speed;
   params.radius = radius;
   params.collisionQueryRange = speed * 0.5f;
@@ -637,7 +705,7 @@ void Sapphire::Common::Navi::NaviProvider::updateAgentParameters( int32_t naviAg
   dtCrowdAgentParams params{};
   std::memset( &params, 0, sizeof( params ) );
   params.height = 3.f;
-  params.maxAcceleration = 10.f;
+  params.maxAcceleration = 40.f;
   params.maxSpeed = speed;
   params.radius = radius;
   params.collisionQueryRange = speed * 0.5f;
@@ -652,11 +720,13 @@ void Sapphire::Common::Navi::NaviProvider::updateAgentParameters( int32_t naviAg
   m_pCrowd->updateAgentParameters( naviAgentId, &params );
 }
 
-void Sapphire::Common::Navi::NaviProvider::updateCrowd( float timeInSeconds )
+void Sapphire::Common::Navi::NaviProvider::update( float timeInSeconds )
 {
   dtCrowdAgentDebugInfo info{};
   info.idx = -1;
   info.vod = m_vod;
+
+  m_tileCache->update( timeInSeconds, m_naviMesh );
   m_pCrowd->update( timeInSeconds, &info );
 }
 
@@ -679,7 +749,7 @@ void Sapphire::Common::Navi::NaviProvider::resetMoveTarget( int32_t naviAgentId 
 }
 
 void Sapphire::Common::Navi::NaviProvider::setMoveTarget( int32_t naviAgentId,
-                                                         const Sapphire::Common::FFXIVARR_POSITION3& endPos )
+                                                         const Sapphire::Common::Vector3& endPos )
 {
   // Find nearest point on navmesh and set move request to that location.
   dtNavMeshQuery* navquery = m_naviMeshQuery;
@@ -708,7 +778,7 @@ void Sapphire::Common::Navi::NaviProvider::setMoveTarget( int32_t naviAgentId,
   }
 }
 
-Sapphire::Common::FFXIVARR_POSITION3 Sapphire::Common::Navi::NaviProvider::getAgentPos( int32_t naviAgentId )
+Sapphire::Common::Vector3 Sapphire::Common::Navi::NaviProvider::getAgentPos( int32_t naviAgentId )
 {
   const dtCrowdAgent* ag = m_pCrowd->getAgent( naviAgentId );
   if( !ag )
@@ -744,8 +814,9 @@ bool Sapphire::Common::Navi::NaviProvider::hasTargetState( int32_t naviAgentId )
   return ag->targetState != DT_CROWDAGENT_TARGET_NONE;
 }
 
-int32_t Sapphire::Common::Navi::NaviProvider::updateAgentPosition( int32_t naviAgentId, const Common::FFXIVARR_POSITION3& pos, float radius, float speed )
+int32_t Sapphire::Common::Navi::NaviProvider::updateAgentPosition( int32_t naviAgentId, const Common::Vector3& pos, float radius, float speed )
 {
+  resetMoveTarget( naviAgentId );
   removeAgent( naviAgentId );
   auto newIndex = addAgent( pos, radius, speed );
   return newIndex;
@@ -769,4 +840,88 @@ void Sapphire::Common::Navi::NaviProvider::removeAgentUpdateFlag( int32_t naviAg
     return;
 
   ag->params.updateFlags &= ~flags;
+}
+
+void Sapphire::Common::Navi::NaviProvider::toggleBox( dtObstacleRef& obstacleRef, const Common::Vector3& pos,
+                                                       const Common::Vector3& halfExtents, float rot, bool enabled )
+{
+  float fpos[ 3 ] = { pos.x, pos.y, pos.z };
+  // Half-extents: Width, Height, Depth
+  float fhalfExtents[ 3 ] = { halfExtents.x, halfExtents.y, halfExtents.z };
+
+  if( obstacleRef != 0 && enabled )
+  {
+    m_tileCache->removeObstacle( obstacleRef );
+    obstacleRef = 0;
+  }
+
+  if( enabled && obstacleRef == 0 )
+  {
+    auto status = m_tileCache->addBoxObstacle( fpos, fhalfExtents, rot, &obstacleRef );
+    if( dtStatusFailed( status ) )
+      Logger::error( "[Navmesh] addBoxObstacle failed (request queue full?) at X:{} Y:{} Z:{}",
+                     pos.x, pos.y, pos.z );
+  }
+  else if( !enabled && obstacleRef != 0 )
+  {
+    // REMOVE: Use the previously assigned doorRef to identify the obstacle
+    m_tileCache->removeObstacle( obstacleRef );
+    // RESET: Clear the handle so the system knows the door is "free"
+    obstacleRef = 0;
+  }
+}
+
+void Sapphire::Common::Navi::NaviProvider::toggleObstacle( dtObstacleRef& obstacleRef, const Common::Vector3& pos, float radius, float height, bool enabled )
+{
+  float fpos[ 3 ] = { pos.x, pos.y, pos.z };
+
+  if( obstacleRef != 0 && enabled )
+  {
+    m_tileCache->removeObstacle( obstacleRef );
+    obstacleRef = 0;
+  }
+
+  if( enabled && obstacleRef == 0 )
+  {
+    auto status = m_tileCache->addObstacle( fpos, radius, height, &obstacleRef );
+    if( dtStatusFailed( status ) )
+      Logger::error( "[Navmesh] addObstacle failed (request queue full?) at X:{} Y:{} Z:{}",
+                     pos.x, pos.y, pos.z );
+  }
+  else if( !enabled && obstacleRef != 0 )
+  {
+    // REMOVE: Use the previously assigned doorRef to identify the obstacle
+    m_tileCache->removeObstacle( obstacleRef );
+    // RESET: Clear the handle so the system knows the door is "free"
+    obstacleRef = 0;
+  }
+}
+
+bool Sapphire::Common::Navi::NaviProvider::hasLineOfSight( const Common::Vector3& startPos, const Common::Vector3& endPos )
+{
+  if( m_naviMeshQuery == nullptr )
+  {
+    Logger::error( "[Navmesh] hasLineOfSight: m_naviMeshQuery is null" );
+    return true;
+  }
+
+  dtQueryFilter filter;
+  // 1. DETOUR CHECK: Is the path clear on the NavMesh?
+  dtPolyRef startRef{ 0 };
+  float nearestPt[ 3 ];
+  float extents[ 3 ] = { 2.0f, 4.0f, 2.0f };
+  float fstartPos[ 3 ] = { startPos.x, startPos.y, startPos.z };
+  float fendPos[ 3 ] = { endPos.x, endPos.y, endPos.z };
+  m_naviMeshQuery->findNearestPoly( fstartPos, extents, &filter, &startRef, nearestPt );
+
+  dtRaycastHit navHit{ 0 };
+  m_naviMeshQuery->raycast( startRef, fstartPos, fendPos, &filter, 0, &navHit );
+
+  // If navHit.t < 1.0, the ray hit a NavMesh boundary (a wall or a hole)
+  if( navHit.t < 1.0f )
+  {
+    return false;
+  }
+
+  return true;// Both checks passed
 }

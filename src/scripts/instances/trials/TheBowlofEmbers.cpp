@@ -1,6 +1,7 @@
 #include <ScriptObject.h>
 #include <Territory/InstanceContent.h>
 #include <Encounter/Encounter.h>
+#include <Actor/Player.h>
 
 using namespace Sapphire;
 
@@ -11,21 +12,29 @@ public:
   static constexpr int VAL_IFRIT_HP = 13884;
 
   TheBowlofEmbers() : Sapphire::ScriptAPI::InstanceContentScript( 20001 )
-  { }
+  {}
 
   void setupEncounter( InstanceContent& instance, EncounterPtr pEncounter )
   {
-    std::vector< EncounterActor > actors { { NPC_IFRIT, VAL_IFRIT_HP, Common::BNpcType::Enemy, 0 } };
-    pEncounter->setInitialActorSetup( actors );
+    EncounterSetup setup;
+    setup.timelineName = "trials/IfritNormal";
+    setup.encounterShape = EncounterShape::CYLINDER;
+    setup.position = { 0, 0, 0 };   // centre
+    setup.position2 = { 80, 10, 0 };// radius, height, unused
+    setup.hasLockout = true;
+    setup.bnpcSetupList = { { NPC_IFRIT, VAL_IFRIT_HP, Common::BNpcType::Enemy, Entity::BNpcFlag::NoRoam, true } };
+
+    pEncounter->setEncounterSetup( setup );
     pEncounter->init();
   }
 
   void onInit( InstanceContent& instance ) override
   {
+    instance.addEObj( "Entrance", 2000182, 4177874, 4177871, 5, { -16.000000f, 0.000000f, 0.000000f }, 1.000000f, 0.000000f, 0 );
+
     auto instanceContent = instance.shared_from_this()->getAsInstanceContent();
     auto director = std::static_pointer_cast< Event::Director >( instanceContent );
-    instance.addEObj( "Entrance", 2000182, 4177874, 4177871, 5, { -16.000000f, 0.000000f, 0.000000f }, 1.000000f, 0.000000f, 0);
-    auto pEncounter = std::make_shared< Encounter >( instanceContent, director, "IfritNormal" );
+    auto pEncounter = std::make_shared< Encounter >( instanceContent, director, "trials/IfritNormal" );
     setupEncounter( instance, pEncounter );
 
     instance.setEncounter( pEncounter );
@@ -33,10 +42,6 @@ public:
 
   void onReset( InstanceContent& instance ) override
   {
-    auto pEncounter = instance.getEncounter();
-    if( !pEncounter )
-      return;
-    setupEncounter( instance, pEncounter );
   }
 
   void onUpdate( InstanceContent& instance, uint64_t tickCount ) override
@@ -53,15 +58,32 @@ public:
         pEncounter->start();
       }
 
-      if( pEncounter )
-        pEncounter->update( tickCount );
+      pEncounter->update( tickCount );
 
       // Fight end condition
-      if( pEncounter->getStatus() == EncounterStatus::ACTIVE && ifrit && ( !ifrit->isAlive() ) )
+      if( pEncounter->getStatus() != EncounterStatus::SUCCESS )
       {
-        //Logger::debug( "Setting duty state to failed!" );
-        pEncounter->setStatus( EncounterStatus::SUCCESS );
-        instance.setState( InstanceContentState::DutyFinished );
+        if( ifrit && ( !ifrit->isAlive() ) )
+        {
+          //Logger::debug( "Setting duty state to failed!" );
+          pEncounter->setStatus( EncounterStatus::SUCCESS );
+          instance.setState( InstanceContentState::DutyFinished );
+        }
+      }
+
+      auto deadPlayers = 0;
+      for( const auto& player : instance.getPlayers() )
+      {
+        if( player.second->getHp() != 0 )
+          break;
+
+        ++deadPlayers;
+      }
+
+      if( deadPlayers == instance.getInstancePlayerCount() )
+      {
+        pEncounter->setStatus( EncounterStatus::FAIL );
+        instance.setState( InstanceContentState::DutyReset );
       }
     }
   }
@@ -72,7 +94,7 @@ public:
     {
       case InstanceContentState::DutyFinished:
       {
-        instance.addEObj( "Exit", 2000139, 0, 4177870, 4, { 16.000000f, 0.000000f, 0.000000f }, 1.000000f, 0.000000f, 0);
+        instance.addEObj( "Exit", 2000139, 0, 4177870, 4, { 16.000000f, 0.000000f, 0.000000f }, 1.000000f, 0.000000f, 0 );
       }
     }
   }
@@ -80,9 +102,7 @@ public:
   void onEnterTerritory( InstanceContent& instance, Entity::Player& player, uint32_t eventId, uint16_t param1,
                          uint16_t param2 ) override
   {
-
   }
-
 };
 
 EXPOSE_SCRIPT( TheBowlofEmbers );

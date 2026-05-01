@@ -18,6 +18,8 @@
 
 #include "Network/Util/PacketUtil.h"
 
+#include "AI/TargetHelper.h"
+
 #include "Action/Action.h"
 #include "WorldServer.h"
 #include "Session.h"
@@ -27,6 +29,8 @@
 #include "Manager/TerritoryMgr.h"
 #include "Manager/MgrUtil.h"
 #include "Manager/PlayerMgr.h"
+#include "Script/ScriptMgr.h"
+
 #include "Navi/NaviProvider.h"
 #include "Common.h"
 
@@ -39,12 +43,11 @@ using namespace Sapphire::Network::Packets;
 using namespace Sapphire::Network::Packets::WorldPackets::Server;
 using namespace Sapphire::Network::ActorControl;
 
-Chara::Chara( ObjKind type ) :
-  GameObject( type ),
-  m_pose( 0 ),
-  m_targetId( INVALID_GAME_OBJECT_ID64 ),
-  m_directorId( 0 ),
-  m_radius( 2.f )
+Chara::Chara( ObjKind type ) : GameObject( type ),
+                               m_pose( 0 ),
+                               m_targetId( INVALID_GAME_OBJECT_ID64 ),
+                               m_directorId( 0 ),
+                               m_radius( 2.f )
 {
   m_lastTickTime = 0;
   m_lastUpdate = 0;
@@ -195,7 +198,7 @@ bool Chara::isAlive() const
   return ( m_hp > 0 );
 }
 
-void Chara::setPos( const Common::FFXIVARR_POSITION3& pos, bool broadcastUpdate )
+void Chara::setPos( const Common::Vector3& pos, bool broadcastUpdate )
 {
   GameObject::setPos( pos, broadcastUpdate );
   m_dirtyFlag |= DirtyFlag::Position;
@@ -297,6 +300,15 @@ void Chara::die()
   // fire onDeath event
   onDeath();
 
+  auto& teriMgr = Common::Service< Manager::TerritoryMgr >::ref();
+  auto pTeri = teriMgr.getTerritoryByGuId( getTerritoryId() );
+
+  if( auto pInstance = pTeri->getAsInstanceContent() )
+  {
+    auto& scriptMgr = Common::Service< Scripting::ScriptMgr >::ref();
+    scriptMgr.onInstanceActorDeath( *pInstance, *this );
+  }
+
   removeStatusEffectByFlag( Common::StatusEffectFlag::RemoveOnDeath );
 
   // if the actor is a player, the update needs to be send to himself too
@@ -322,21 +334,24 @@ position
 
 \param Position to look towards
 */
-bool Chara::face( const FFXIVARR_POSITION3& p )
+bool Chara::face( const Vector3& p )
 {
   float oldRot = getRot();
-  float rot = Common::Util::calcAngFrom( getPos().x, getPos().z, p.x, p.z );
 
-  // Convert to facing direction
-  float newRot = rot + ( PI / 2 );
+  float dx = p.x - getPos().x;
+  float dz = p.z - getPos().z;
 
-  // Normalize to [-π, π] range
-  newRot = -fmod( newRot + PI, 2 * PI ) - PI;
+  if( dx == 0.0f && dz == 0.0f )
+    return true;
+
+  // -3.14 == 3.14 in-game so normalize+clamp (-3.14, 3.14).
+  float newRot = atan2f( dx, dz );
+  if( newRot >= PI )
+    newRot = -PI;
 
   setRot( newRot );
 
-  return ( fabs( oldRot - newRot ) <= std::numeric_limits< float >::epsilon() *
-           fmax( fabs( oldRot ), fabs( newRot ) ) );
+  return ( oldRot == newRot );
 }
 
 
@@ -355,23 +370,36 @@ void Chara::setStance( Stance stance )
 /*!
 Check if an action is queued for execution, if so update it
 and if fully performed, clean up again.
-
-\return true if a queued action has been updated
 */
-bool Chara::checkAction()
+void Chara::processActions()
 {
   if( m_pCurrentAction == nullptr )
-    return false;
+    return;
 
-  if( m_pCurrentAction->update() )
+  // delay removing action for 3 tick after interrupting
+  // todo: why does this need to be held for 3 ticks for TimelinePack to pick this up?
+  if( m_pCurrentAction->isInterrupted() && m_pCurrentAction->getInterruptTickCount() < 3 )
+  {
+    if( m_pCurrentAction->getInterruptTickCount() == -1 )
+      m_pCurrentAction->update();
+    else
+      m_pCurrentAction->addInterruptTickCount();
+  }
+  else if( m_pCurrentAction->update() )
+  {
     m_pCurrentAction.reset();
+  }
+}
 
-  return true;
+bool Chara::hasAction() const
+{
+  return m_pCurrentAction != nullptr;
 }
 
 void Chara::update( uint64_t tickCount )
 {
   updateStatusEffects();
+  processActions();
 
   if( std::difftime( static_cast< time_t >( tickCount ), m_lastTickTime ) > 3000 )
   {
@@ -416,6 +444,9 @@ void Chara::takeDamage( uint32_t damage, bool broadcastUpdate )
   // dont keep dying
   if( m_status == ActorStatus::Dead )
     return;
+
+  if( m_invincibilityType == InvincibilityIgnoreDamage )
+    damage = 0;
 
   if( damage >= m_hp )
   {
@@ -546,6 +577,10 @@ void Chara::addStatusEffect( StatusEffect::StatusEffectPtr pEffect )
   pEffect->setSlot( nextSlot );
   m_statusEffectMap[ nextSlot ] = pEffect;
   pEffect->applyStatus();
+
+  Network::Util::Packet::sendActorControl( getInRangePlayerIds( false ), getId(), StatusEffectGain,
+                                           pEffect->getId() );
+  Network::Util::Packet::sendHudParam( *this );
 }
 
 /*! \param StatusEffectPtr to be applied to the actor */
@@ -594,13 +629,13 @@ void Chara::replaceSingleStatusEffect( uint32_t slotId, StatusEffect::StatusEffe
   pStatus->applyStatus();
 }
 
-void Chara::replaceSingleStatusEffectById( uint32_t id )
+void Chara::replaceSingleStatusEffectById( uint32_t id, StatusEffect::StatusEffectPtr pStatus )
 {
   for( const auto& effectIt : m_statusEffectMap )
   {
     if( effectIt.second->getId() == id )
     {
-      removeStatusEffect( effectIt.first, false );
+      replaceSingleStatusEffect( effectIt.first, pStatus );
       break;
     }
   }
@@ -660,7 +695,7 @@ void Chara::removeStatusEffectByFlag( Common::StatusEffectFlag flag )
 }
 
 std::map< uint8_t, Sapphire::StatusEffect::StatusEffectPtr >::iterator Chara::removeStatusEffect(
-  uint8_t effectSlotId, bool updateStatus )
+        uint8_t effectSlotId, bool updateStatus )
 {
   auto pEffectIt = m_statusEffectMap.find( effectSlotId );
   if( pEffectIt == m_statusEffectMap.end() )
@@ -671,25 +706,31 @@ std::map< uint8_t, Sapphire::StatusEffect::StatusEffectPtr >::iterator Chara::re
   auto pEffect = pEffectIt->second;
   pEffect->removeStatus();
 
-  auto it = m_statusEffectMap.erase( pEffectIt );
+  m_statusEffectMap.erase( pEffectIt );
 
-  for( auto effectIt = it; effectIt != m_statusEffectMap.end(); )
+  for( auto effectIt = m_statusEffectMap.upper_bound( effectSlotId ); effectIt != m_statusEffectMap.end(); )
   {
     // if the status is *after* the one being removed, shift the slots down by one
-    auto shifted_slot = effectIt->first - 1;
+    const auto currentSlot = effectIt->first;
+    const auto shiftedSlot = static_cast< uint8_t >( currentSlot - 1 );
+    ++effectIt;
 
-    auto node_slot = m_statusEffectSlots.extract( effectIt->first );
-    node_slot.value() = shifted_slot;
-    m_statusEffectSlots.insert( std::move( node_slot ) );
+    auto node_slot = m_statusEffectSlots.extract( currentSlot );
+    if( !node_slot.empty() )
+    {
+      node_slot.value() = shiftedSlot;
+      m_statusEffectSlots.insert( std::move( node_slot ) );
+    }
 
-    auto node_status = m_statusEffectMap.extract( effectIt->first );
-    node_status.key() = shifted_slot;
+    auto node_status = m_statusEffectMap.extract( currentSlot );
+    if( node_status.empty() )
+      continue;
+
+    node_status.key() = shiftedSlot;
+    node_status.mapped()->setSlot( shiftedSlot );
     m_statusEffectMap.insert( std::move( node_status ) );
 
-    effectIt->second->setSlot( effectIt->second->getSlot() - 1 );
-
-    Logger::debug( "Shifted slot {} to slot: {}", effectSlotId, shifted_slot );
-    ++effectIt;
+    Logger::debug( "Shifted slot {} to slot: {}", currentSlot, shiftedSlot );
   }
 
   Logger::debug( "Slot id being freed: {}", effectSlotId );
@@ -701,7 +742,7 @@ std::map< uint8_t, Sapphire::StatusEffect::StatusEffectPtr >::iterator Chara::re
     Network::Util::Packet::sendHudParam( *this );
   }
 
-  return it;
+  return m_statusEffectMap.lower_bound( effectSlotId );
 }
 
 std::map< uint8_t, StatusEffect::StatusEffectPtr > Chara::getStatusEffectMap() const
@@ -720,12 +761,12 @@ Sapphire::StatusEffect::StatusEffectPtr Chara::getStatusEffectById( uint32_t id 
   return nullptr;
 }
 
-const uint8_t *Chara::getLookArray() const
+const uint8_t* Chara::getLookArray() const
 {
   return m_customize;
 }
 
-const uint32_t *Chara::getModelArray() const
+const uint32_t* Chara::getModelArray() const
 {
   return m_modelEquip;
 }
@@ -749,7 +790,8 @@ void Chara::sendStatusEffectUpdate()
   for( const auto& effectIt : m_statusEffectMap )
   {
     float timeLeft = static_cast< float >( effectIt.second->getDuration() -
-                                           ( currentTimeMs - effectIt.second->getStartTimeMs() ) ) / 1000;
+                                           ( currentTimeMs - effectIt.second->getStartTimeMs() ) ) /
+                     1000;
     statusEffectList->data().effect[ slot ].Time = timeLeft;
     statusEffectList->data().effect[ slot ].Id = effectIt.second->getId();
     statusEffectList->data().effect[ slot ].Source = effectIt.second->getSrcActorId();
@@ -794,6 +836,17 @@ bool Chara::hasStatusEffect( uint32_t id )
       return true;
   }
 
+  return false;
+}
+
+bool Chara::hasStatusEffectByFlag( Common::StatusEffectFlag flag )
+{
+  auto uflag = static_cast< uint32_t >( flag );
+  for( const auto& [ key, pEffect ] : m_statusEffectMap )
+  {
+    if( ( pEffect->getFlag() & uflag ) != 0 )
+      return true;
+  }
   return false;
 }
 
@@ -899,7 +952,13 @@ Common::BaseParam Chara::getPrimaryStat() const
   auto classJob = exdData.getRow< Excel::ClassJob >( static_cast< uint16_t >( getClass() ) );
   assert( classJob );
 
-  return static_cast< Common::BaseParam >( classJob->data().Role );
+  auto index = classJob->data().Role;
+  if( index == 2 ) // Index for VIT and DEX are swapped in this EXD
+    index = 3;
+  else if( index == 3 )
+    index = 2;
+
+  return static_cast< Common::BaseParam >( index );
 }
 
 uint32_t Chara::getStatValue( Common::BaseParam baseParam ) const
@@ -934,6 +993,21 @@ void Chara::setStatValue( Common::BaseParam baseParam, uint32_t value )
   m_baseStats[ index ] = value;
 }
 
+// Putting this here as an alternative to getModifier for bool checks
+bool Chara::hasModifier( Common::ParamModifier paramModifier ) const
+{
+  for( const auto& [ key, status ] : m_statusEffectMap )
+  {
+    for( const auto& [ mod, val ] : status->getModifiers() )
+    {
+      if( mod == paramModifier )
+        return true;
+    }
+  }
+
+  return false;
+}
+
 float Chara::getModifier( Common::ParamModifier paramModifier ) const
 {
   auto result = paramModifier >= Common::ParamModifier::StrengthPercent ? 1.0f : 0;
@@ -955,10 +1029,20 @@ float Chara::getModifier( Common::ParamModifier paramModifier ) const
   return result;
 }
 
-// Compute forward direction based on rotation angle (assuming rotation around Z axis)
-FFXIVARR_POSITION3 Chara::getForwardVector() const
+float Chara::getPhysicalWeaponDamage()
 {
-  return Common::Util::normalize( FFXIVARR_POSITION3{ std::sin( getRot() ), 0, std::cos( getRot() ) } );
+  return 1.0f;
+}
+
+float Chara::getMagicalWeaponDamage()
+{
+  return 1.0f;
+}
+
+// Compute forward direction based on rotation angle (assuming rotation around Z axis)
+Vector3 Chara::getForwardVector() const
+{
+  return Common::Util::normalize( Vector3{ std::sin( getRot() ), 0, std::cos( getRot() ) } );
 }
 
 // Function to check if actor is facing target
@@ -976,14 +1060,24 @@ bool Chara::isFacingTarget( const Chara& other, float threshold )
   return dot >= threshold;
 }
 
-bool Sapphire::Entity::Chara::isHostile( const Chara& chara )
+bool Sapphire::Entity::Chara::isHostile( Chara& chara )
 {
-  return m_objKind != chara.getObjKind();
+  static auto pBattalionFilter = std::make_shared< AI::OwnBattalionFilter >();
+
+  auto pTarget = chara.getAsChara();
+  auto pSrc = getAsChara();
+
+  return !pBattalionFilter->isApplicable( pSrc, pTarget );
 }
 
-bool Sapphire::Entity::Chara::isFriendly( const Chara& chara )
+bool Sapphire::Entity::Chara::isFriendly( Chara& chara )
 {
-  return m_objKind == chara.getObjKind();
+  static auto pBattalionFilter = std::make_shared< AI::OwnBattalionFilter >();
+
+  auto pTarget = chara.getAsChara();
+  auto pSrc = getAsChara();
+
+  return pBattalionFilter->isApplicable( pSrc, pTarget );
 }
 
 void Chara::onTick()
@@ -1026,7 +1120,7 @@ void Chara::onTick()
   }
 }
 
-void Chara::knockback( const FFXIVARR_POSITION3& origin, float distance, bool ignoreNav )
+void Chara::knockback( const Vector3& origin, float distance, bool ignoreNav )
 {
   auto kbPos = Common::Util::getKnockbackPosition( origin, m_pos, distance );
   auto& teriMgr = Common::Service< Manager::TerritoryMgr >::ref();
@@ -1037,7 +1131,7 @@ void Chara::knockback( const FFXIVARR_POSITION3& origin, float distance, bool ig
     auto pNav = pTeri->getNaviProvider();
     auto path = pNav->findFollowPath( m_pos, kbPos );
 
-    FFXIVARR_POSITION3 navPos{ origin };
+    Vector3 navPos{ origin };
     float prevDistance{ 1000.f };
     for( const auto& point : path )
     {
@@ -1049,21 +1143,31 @@ void Chara::knockback( const FFXIVARR_POSITION3& origin, float distance, bool ig
       }
     }
     setPos( navPos );
+
     // speed needs to be reset properly here
-    pNav->updateAgentPosition( getAgentId(), getPos(), getRadius(), 1 );
+    if( !isPlayer() )
+      setAgentId( pNav->updateAgentPosition( getAgentId(), getPos(), getRadius(), pNav->getAgentSpeed( getAgentId() ) ) );
   }
   else
   {
     setPos( kbPos );
   }
   pTeri->updateActorPosition( *this );
+
+  auto pTransferPacket = makeZonePacket< FFXIVIpcTransfer >( getId() );
+  pTransferPacket->data().dir = Common::Util::floatToUInt16Rot( getRot() );
+  pTransferPacket->data().pos[ 0 ] = Common::Util::floatToUInt16( kbPos.x );
+  pTransferPacket->data().pos[ 1 ] = Common::Util::floatToUInt16( kbPos.y );
+  pTransferPacket->data().pos[ 2 ] = Common::Util::floatToUInt16( kbPos.z );
+  pTransferPacket->data().duration = 1.0f;
+
   // todo: send the correct knockback packet to player
   server().queueForPlayers( getInRangePlayerIds(),
-                            std::make_shared< MoveActorPacket >( *this, getRotUInt8(), 2, 0, 0, 0x5A / 4 ) );
+                            pTransferPacket );
 }
 
 void Chara::createAreaObject( uint32_t actionId, uint32_t actionPotency, uint32_t vfxId, float scale,
-                              const Common::FFXIVARR_POSITION3& pos )
+                              const Common::Vector3& pos )
 {
   removeAreaObject();
   removeSingleStatusEffectByFlag( Common::StatusEffectFlag::GroundTarget );

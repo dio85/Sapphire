@@ -44,7 +44,7 @@ bool Sapphire::HousingZone::init()
   auto& db = Common::Service< Db::DbWorkerPool< Db::ZoneDbConnection > >::ref();
   {
     auto res = db.query( "SELECT * FROM landset WHERE landsetid = " + std::to_string( m_landSetId ) );
-    if( !res->next() )
+    if( !res || !res->next() )
     {
       db.directExecute( "INSERT INTO landset ( landsetid ) VALUES ( " + std::to_string( m_landSetId ) + " );" );
     }
@@ -305,7 +305,7 @@ Sapphire::Entity::EventObjectPtr Sapphire::HousingZone::registerEstateEntranceEO
   auto landInfo = info->_data.Lands[ landId ];
   auto& instanceObjectCache = Common::Service< InstanceObjectCache >::ref();
 
-  FFXIVARR_POSITION3 pos{ 0, 10, 0 };
+  Vector3 pos{ 0, 10, 0 };
   auto eObjInfo = instanceObjectCache.getEObj( landInfo.SignboardEObj );
   if( eObjInfo )
   {

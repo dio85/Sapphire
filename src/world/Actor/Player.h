@@ -391,6 +391,10 @@ namespace Sapphire::Entity
 
     void calculateStats() override;
 
+    float getPhysicalWeaponDamage() override;
+
+    float getMagicalWeaponDamage() override;
+
     // Aetheryte / Action / Attribute bitmasks
     //////////////////////////////////////////////////////////////////////////////////////////////////////
     /*! register aetheryte aetheryteId and send update */
@@ -463,7 +467,7 @@ namespace Sapphire::Entity
     /*! return a reference to the setMount guide bitmask array */
     MountList& getMountGuideBitmask();
 
-    bool checkAction() override;
+    void processActions() override;
 
     bool hasQueuedAction() const;
 
@@ -703,7 +707,7 @@ namespace Sapphire::Entity
     using InvSlotPair = std::pair< uint16_t, int8_t >;
     using InvSlotPairVec = std::vector< InvSlotPair >;
 
-    ItemPtr createItem( uint32_t catalogId, uint32_t quantity = 1 );
+    ItemPtr createItem( uint32_t catalogId, uint32_t quantity = 1, bool isHq = false );
 
     bool loadInventory();
 
@@ -721,6 +725,7 @@ namespace Sapphire::Entity
     void splitItem( uint16_t fromInventoryId, uint16_t fromSlotId, uint16_t toInventoryId, uint16_t toSlot, uint16_t splitCount );
     void mergeItem( uint16_t fromInventoryId, uint16_t fromSlotId, uint16_t toInventoryId, uint16_t toSlot );
     ItemPtr getItemAt( uint16_t containerId, uint16_t slotId );
+    bool isValidInventoryContainer( uint16_t containerId ) const;
     bool updateContainer( uint16_t storageId, uint16_t slotId, ItemPtr pItem );
 
     /*! calculate and return player ilvl based off equipped gear */
@@ -784,14 +789,14 @@ namespace Sapphire::Entity
     uint64_t m_lastMoveTime{};
     uint8_t m_lastMoveflag{};
 
-    void setFalling( bool state, const Common::FFXIVARR_POSITION3& pos, bool ignoreDamage = false );
+    void setFalling( bool state, const Common::Vector3& pos, bool ignoreDamage = false );
     bool isFalling() const;
 
     // todo: sort this requestkey pcsearch mess
     void setLastPcSearchResult( std::vector< uint32_t > result );
     std::vector< uint32_t >& getLastPcSearchResult();
 
-    const Common::FFXIVARR_POSITION3& getPrevPos() const;
+    const Common::Vector3& getPrevPos() const;
     float getPrevRot() const;
 
     bool isConnected() const;
@@ -815,7 +820,7 @@ namespace Sapphire::Entity
 
     // keep track of movement state of player
     bool m_running{false};
-    Common::FFXIVARR_POSITION3 m_initialFallPos{};
+    Common::Vector3 m_initialFallPos{};
 
     bool m_markedForRemoval;
 
@@ -832,7 +837,7 @@ namespace Sapphire::Entity
 
     InventoryMap m_storageMap;
 
-    Common::FFXIVARR_POSITION3 m_prevPos{};
+    Common::Vector3 m_prevPos{};
     uint32_t m_prevTerritoryTypeId{};
     uint32_t m_prevTerritoryId{};
     float m_prevRot{};

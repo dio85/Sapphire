@@ -5,6 +5,7 @@
 #include <Exd/ExdData.h>
 #include <Database/DatabaseDef.h>
 #include <Service.h>
+#include <type_traits>
 
 #include "Network/PacketWrappers/PlayerSetupPacket.h"
 
@@ -33,13 +34,14 @@ bool Player::loadFromDb( uint64_t characterId )
   stmt->set( 1, characterId );
   auto res = db.query( stmt );
 
-  if( !res->next() )
+  if( !res || !res->next() )
     return false;
 
   m_id = res->getUInt( "EntityId" );
 
   auto name = res->getString( "Name" );
-  strcpy( m_name, name.c_str() );
+  std::strncpy( m_name, name.c_str(), sizeof( m_name ) - 1 );
+  m_name[ sizeof( m_name ) - 1 ] = '\0';
 
   auto zoneId = res->getUInt( "TerritoryType" );
   m_territoryId = res->getUInt( "TerritoryId" );
@@ -61,7 +63,10 @@ bool Player::loadFromDb( uint64_t characterId )
 
   // Model
   auto custom = res->getBlobVector( "Customize" );
-  memcpy( reinterpret_cast< char* >( m_customize ), custom.data(), custom.size() );
+  const auto copyLen = std::min( custom.size(), sizeof( m_customize ) );
+  std::memcpy( m_customize, custom.data(), copyLen );
+  if( custom.size() != sizeof( m_customize ) )
+    Logger::error( "Invalid Customize blob size for character#{}", m_characterId );
 
   m_modelMainWeapon = res->getUInt64( "ModelMainWeapon" );
 
@@ -144,7 +149,12 @@ bool Player::loadFromDb( uint64_t characterId )
   auto gcRank = res->getBlobVector( "GrandCompanyRank" );
   memcpy( m_gcRank.data(), gcRank.data(), gcRank.size() );
 
-  res->free();
+  // Stats
+  m_hp = res->getUInt( "Hp" );
+  m_mp = res->getUInt( "Mp" );
+  m_tp = res->getUInt( "Tp" );
+  m_mount = res->getUInt8( "Mount" );
+  res.reset();
 
   if( !loadActiveQuests() || !loadClassData() || !loadSearchInfo() || !loadHuntingLog() || !loadFriendList() || !loadBlacklist() || !loadAchievements() )
   {
@@ -153,14 +163,8 @@ bool Player::loadFromDb( uint64_t characterId )
 
   initInventory();
 
-  // Stats
-  m_hp = res->getUInt( "Hp" );
-  m_mp = res->getUInt( "Mp" );
-  m_tp = res->getUInt( "Tp" );
   m_maxHp = getMaxHp();
   m_maxMp = getMaxMp();
-
-  m_mount = res->getUInt8( "Mount" );
 
   m_modelSubWeapon = 0;
   m_lastTickTime = 0;
@@ -190,6 +194,8 @@ bool Player::loadActiveQuests()
 
   stmt->setUInt64( 1, m_characterId );
   auto res = db.query( stmt );
+  if( !res )
+    return false;
 
   for( size_t idx = 0; idx < 30; ++ idx )
     m_quests[ idx ] = World::Quest();
@@ -197,6 +203,8 @@ bool Player::loadActiveQuests()
   while( res->next() )
   {
     auto slotId = res->getUInt8( 2 );
+    if( slotId >= m_quests.size() )
+      continue;
 
     auto quest = World::Quest( res->getUInt16( 3 ), res->getUInt8( 4 ), res->getUInt8( 5 ) );
     quest.setUI8A( res->getUInt8( 6 ) );
@@ -219,6 +227,8 @@ bool Player::loadAchievements()
 
   stmt->setUInt64( 1, m_characterId );
   auto res = db.query( stmt );
+  if( !res )
+    return false;
 
   while( res->next() )
   {
@@ -262,17 +272,22 @@ bool Player::loadClassData()
   auto stmt = db.getPreparedStatement( Db::ZoneDbStatements::CHARA_CLASS_SEL );
   stmt->setUInt64( 1, m_characterId );
   auto res = db.query( stmt );
+  if( !res )
+    return false;
 
   while( res->next() )
   {
     auto index = res->getUInt16( 1 );
+    if( index >= m_classArray.size() || index >= m_expArray.size() || index >= m_borrowActions.size() )
+      continue;
+
     auto exp = res->getUInt( 2 );
     auto lvl = res->getUInt8( 3 );
     auto borrowAction = res->getBlobVector( "BorrowAction" );
 
     m_classArray[ index ] = lvl;
     m_expArray[ index ] = exp;
-    memcpy( m_borrowActions[ index ].data(), borrowAction.data(), borrowAction.size() );
+    std::memcpy( m_borrowActions[ index ].data(), borrowAction.data(), std::min( borrowAction.size(), m_borrowActions[ index ].size() ) );
   }
 
   return true;
@@ -285,7 +300,7 @@ bool Player::loadSearchInfo()
   stmt->setUInt64( 1, m_characterId );
   auto res = db.query( stmt );
 
-  if( !res->next() )
+  if( !res || !res->next() )
   {
     Logger::error( "Failed to load search info for character#{}", m_characterId );
     return false;
@@ -296,8 +311,8 @@ bool Player::loadSearchInfo()
 
   // todo: internally use an std::string instead of a char[]
   auto searchMessage = res->getString( 4 );
-  memset( m_searchMessage, 0, sizeof( m_searchMessage ) );
-  std::copy( searchMessage.begin(), searchMessage.end(), m_searchMessage );
+  std::memset( m_searchMessage, 0, sizeof( m_searchMessage ) );
+  std::copy_n( searchMessage.data(), std::min( searchMessage.size(), sizeof( m_searchMessage ) - 1 ), m_searchMessage );
 
   return true;
 }
@@ -310,7 +325,7 @@ bool Player::loadHuntingLog()
   stmt->setUInt64( 1, m_characterId );
   auto res = db.query( stmt );
 
-  if( !res->next() )
+  if( !res || !res->next() )
   {
     Logger::error( "Failed to load hunting log data for character#{}", m_characterId );
     return false;
@@ -382,7 +397,7 @@ void Player::updateDbChara() const
   stmt->setInt( 8, m_voice );
 
   std::vector< uint8_t > customVec( sizeof( m_customize ) );
-  memcpy( customVec.data(), m_customize, sizeof( m_customize ) );
+  std::memcpy( customVec.data(), m_customize, sizeof( m_customize ) );
   stmt->setBinary( 9, customVec );
 
   stmt->setInt64( 10, m_modelMainWeapon );
@@ -390,7 +405,7 @@ void Player::updateDbChara() const
   stmt->setInt64( 12, m_modelSystemWeapon );
 
   std::vector< uint8_t > modelVec( sizeof( m_modelEquip ) );
-  memcpy( modelVec.data(), m_modelEquip, sizeof( m_modelEquip ) );
+  std::memcpy( modelVec.data(), m_modelEquip, sizeof( m_modelEquip ) );
   stmt->setBinary( 13, modelVec );
 
   stmt->setInt( 14, m_emoteMode ); // EmodeModeType
@@ -423,40 +438,40 @@ void Player::updateDbChara() const
   stmt->setInt( 36, m_activeTitle ); // ActiveTitle
 
   std::vector< uint8_t > titleListVec( sizeof( m_titleList ) );
+  std::memcpy( titleListVec.data(), m_titleList.data(), m_titleList.size() );
   stmt->setBinary( 37, titleListVec );
 
-
   std::vector< uint8_t > aetheryteVec( m_aetheryte.size() );
-  memcpy( aetheryteVec.data(), m_aetheryte.data(), m_aetheryte.size() );
+  std::memcpy( aetheryteVec.data(), m_aetheryte.data(), m_aetheryte.size() );
   stmt->setBinary( 38, aetheryteVec );
 
   std::vector< uint8_t > howToVec( sizeof( m_howTo ) );
-  memcpy( howToVec.data(), m_howTo.data(), m_howTo.size() );
+  std::memcpy( howToVec.data(), m_howTo.data(), m_howTo.size() );
   stmt->setBinary( 39, howToVec );
 
   std::vector< uint8_t > minionsVec( sizeof( m_minionGuide ) );
-  memcpy( minionsVec.data(), m_minionGuide.data(), m_minionGuide.size() );
+  std::memcpy( minionsVec.data(), m_minionGuide.data(), m_minionGuide.size() );
   stmt->setBinary( 40, minionsVec );
 
   std::vector< uint8_t > mountsVec( sizeof( m_mountGuide ) );
-  memcpy( mountsVec.data(), m_mountGuide.data(), m_mountGuide.size() );
+  std::memcpy( mountsVec.data(), m_mountGuide.data(), m_mountGuide.size() );
   stmt->setBinary( 41, mountsVec );
 
   std::vector< uint8_t > orchestrionVec( m_orchestrion.size() );
-  memcpy( orchestrionVec.data(), m_orchestrion.data(), m_orchestrion.size() );
+  std::memcpy( orchestrionVec.data(), m_orchestrion.data(), m_orchestrion.size() );
   stmt->setBinary( 42, orchestrionVec );
 
   stmt->setInt( 43, m_equippedMannequin ); // EquippedMannequin
 
   stmt->setInt( 44, 0 ); // DisplayFlags
   std::vector< uint8_t > questCompleteVec( m_questCompleteFlags.size() );
-  memcpy( questCompleteVec.data(), m_questCompleteFlags.data(), m_questCompleteFlags.size() );
+  std::memcpy( questCompleteVec.data(), m_questCompleteFlags.data(), m_questCompleteFlags.size() );
   stmt->setBinary( 45, questCompleteVec );
 
   stmt->setInt( 46, m_openingSequence );
 
   std::vector< uint8_t > questTrackerVec( sizeof( m_questTracking ) );
-  memcpy( questTrackerVec.data(), m_questTracking.data(), sizeof( m_questTracking ) );
+  std::memcpy( questTrackerVec.data(), m_questTracking.data(), sizeof( m_questTracking ) );
   stmt->setBinary( 47, questTrackerVec );
 
   stmt->setInt( 48, m_gc ); // DisplayFlags
@@ -464,7 +479,7 @@ void Player::updateDbChara() const
   stmt->setBinary( 49, { m_gcRank[ 0 ], m_gcRank[ 1 ], m_gcRank[ 2 ] } );
 
   std::vector< uint8_t > discoveryVec( m_discovery.size() );
-  memcpy( discoveryVec.data(), m_discovery.data(), m_discovery.size() );
+  std::memcpy( discoveryVec.data(), m_discovery.data(), m_discovery.size() );
   stmt->setBinary( 50, discoveryVec );
 
   stmt->setInt( 51, m_gmRank );
@@ -472,7 +487,7 @@ void Player::updateDbChara() const
   stmt->setInt( 52, m_configFlags );
 
   std::vector< uint8_t > unlockVec( m_unlocks.size() );
-  memcpy( unlockVec.data(), m_unlocks.data(), m_unlocks.size() );
+  std::memcpy( unlockVec.data(), m_unlocks.data(), m_unlocks.size() );
   stmt->setBinary( 53, unlockVec );
 
   stmt->setInt( 54, m_cfPenaltyUntil );
@@ -497,7 +512,7 @@ void Player::updateDbClass() const
   stmtS->setInt( 2, getLevel() );
 
   std::vector< uint8_t > borrowActionVec( borrowAction.size() * 4 );
-  memcpy( borrowActionVec.data(), borrowAction.data(), borrowAction.size() * 4 );
+  std::memcpy( borrowActionVec.data(), borrowAction.data(), borrowAction.size() * 4 );
   stmtS->setBinary( 3, borrowActionVec );
 
   stmtS->setUInt64( 4, m_characterId );
@@ -516,7 +531,7 @@ void Player::updateDbMonsterNote()
   {
     vector[ 0 ] = m_huntingLogEntries[ i ].rank;
 
-    memcpy( &vector[ 1 ], reinterpret_cast< uint8_t* >( m_huntingLogEntries[ i ].entries ), 40 );
+    std::memcpy( &vector[ 1 ], reinterpret_cast< uint8_t* >( m_huntingLogEntries[ i ].entries ), 40 );
     stmt->setBinary( i + 1, vector );
   }
   stmt->setUInt64( 13, m_characterId );
@@ -532,8 +547,8 @@ void Player::updateDbFriendList()
   std::vector< uint8_t > friendIds( 1600 );
   std::vector< uint8_t > inviteIds( 1600 );
 
-  memcpy( friendIds.data(), m_friendList.data(), 1600 );
-  memcpy( inviteIds.data(), m_friendInviteList.data(), 1600 );
+  std::memcpy( friendIds.data(), m_friendList.data(), 1600 );
+  std::memcpy( inviteIds.data(), m_friendInviteList.data(), 1600 );
   stmt->setBinary( 1, friendIds );
   stmt->setBinary( 2, inviteIds );
   stmt->setUInt64( 3, m_characterId );
@@ -549,7 +564,7 @@ void Player::updateDbBlacklist()
 
   std::vector< uint8_t > blIds( 1600 );
 
-  memcpy( blIds.data(), m_blacklist.data(), 1600 );
+  std::memcpy( blIds.data(), m_blacklist.data(), 1600 );
   stmt->setBinary( 1, blIds );
   stmt->setUInt64( 2, m_characterId );
   db.execute( stmt );
@@ -561,8 +576,8 @@ void Player::updateDbAchievement()
 
   auto stmt = db.getPreparedStatement( Db::CHARA_ACHIEV_UP );
 
-  std::vector< int > flattenMap( m_achievementData.progressData.size() * 2 );
-
+  std::vector< uint32_t > flattenMap;
+  flattenMap.reserve( m_achievementData.progressData.size() * 2 );
   for( const auto& [ key, val ] : m_achievementData.progressData )
   {
     flattenMap.push_back( key );
@@ -573,9 +588,9 @@ void Player::updateDbAchievement()
   std::vector< uint8_t > progressList( sizeof( uint32_t ) * flattenMap.size() );
   std::vector< uint8_t > history( sizeof( uint16_t ) * m_achievementData.history.size() );
 
-  memcpy( unlockList.data(), m_achievementData.unlockList.data(), unlockList.size() );
-  memcpy( progressList.data(), flattenMap.data(), progressList.size() );
-  memcpy( history.data(), m_achievementData.history.data(), history.size() );
+  std::memcpy( unlockList.data(), m_achievementData.unlockList.data(), unlockList.size() );
+  std::memcpy( progressList.data(), flattenMap.data(), progressList.size() );
+  std::memcpy( history.data(), m_achievementData.history.data(), history.size() );
 
   stmt->setBinary( 1, unlockList );
   stmt->setBinary( 2, progressList );
@@ -692,7 +707,7 @@ void Player::insertDbQuest( const World::Quest& quest, uint8_t index ) const
   db.execute( stmt );
 }
 
-ItemPtr Player::createItem( uint32_t catalogId, uint32_t quantity )
+ItemPtr Player::createItem( uint32_t catalogId, uint32_t quantity, bool isHq )
 {
   auto& exdData = Common::Service< Data::ExdData >::ref();
   auto& db = Common::Service< Db::DbWorkerPool< Db::ZoneDbConnection > >::ref();
@@ -703,9 +718,9 @@ ItemPtr Player::createItem( uint32_t catalogId, uint32_t quantity )
   if( !itemInfo )
     return nullptr;
 
-  uint8_t flags = 0;
+  uint8_t flags = isHq ? 1 : 0;
 
-  ItemPtr pItem = make_Item( itemMgr.getNextUId(), catalogId );
+  ItemPtr pItem = make_Item( itemMgr.getNextUId(), catalogId, isHq );
 
   pItem->setStackSize( quantity );
 
@@ -732,6 +747,8 @@ bool Player::loadInventory()
                          "FROM charaitemgearset " \
                                "WHERE CharacterId =  " + std::to_string( m_characterId ) + " " \
                                "ORDER BY storageId ASC;" );
+  if( !res )
+    return false;
 
   while( res->next() )
   {
@@ -753,6 +770,8 @@ bool Player::loadInventory()
     }
   }
 
+  res.reset();
+
   ///////////////////////////////////////////////////////////////////////////////////////////////////////
   // Load everything
   auto bagRes = db.query( "SELECT storageId, "
@@ -766,6 +785,8 @@ bool Player::loadInventory()
                             "FROM charaiteminventory " \
                                   "WHERE CharacterId =  " + std::to_string( m_characterId ) + " " \
                                   "ORDER BY storageId ASC;" );
+  if( !bagRes )
+    return false;
 
   while( bagRes->next() )
   {
@@ -785,6 +806,8 @@ bool Player::loadInventory()
     }
   }
 
+  bagRes.reset();
+
   auto currencyRes = db.query(fmt::format("SELECT storageId, "
     "container_0, container_1, container_2, container_3, container_4, "
     "container_5, container_6, container_7, container_8, container_9, "
@@ -792,6 +815,8 @@ bool Player::loadInventory()
     "FROM charaitemcurrency " \
     "WHERE CharacterId = {0} " \
     "ORDER BY storageId ASC;", std::to_string(m_characterId)));
+  if( !currencyRes )
+    return false;
 
   while ( currencyRes->next() )
   {
@@ -825,7 +850,7 @@ bool Player::loadFriendList()
   stmt->setUInt64( 1, m_characterId );
   auto res = db.query( stmt );
 
-  if( !res->next() )
+  if( !res || !res->next() )
   {
     Logger::error( "Failed to load friendlist data for character#{}", m_characterId );
     return false;
@@ -850,7 +875,7 @@ bool Player::loadBlacklist()
   stmt->setUInt64( 1, m_characterId );
   auto res = db.query( stmt );
 
-  if( !res->next() )
+  if( !res || !res->next() )
   {
     Logger::error( "Failed to load blacklist data for character#{}", m_characterId );
     return false;
@@ -870,7 +895,7 @@ bool Player::syncLastDBWrite()
   auto& db = Common::Service< Db::DbWorkerPool< Db::ZoneDbConnection > >::ref();
   auto res = db.query( "SELECT UNIX_TIMESTAMP(UPDATE_DATE) FROM charainfo WHERE characterid = " + std::to_string( m_characterId ) );
 
-  if( !res->next() )
+  if( !res || !res->next() )
   {
     Logger::error( "Failed to load update date for character#{}", m_characterId );
     return false;

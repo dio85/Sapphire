@@ -274,8 +274,8 @@ void Sapphire::Network::GameConnection::zoneJumpHandler( const Packets::FFXIVARR
 
   auto pExitRange = instanceObjectCache.getExitRange( player.getTerritoryTypeId(), exitBoxId );
 
-  Common::FFXIVARR_POSITION3 targetPos{};
-  Common::FFXIVARR_POSITION3 targetRot{};
+  Common::Vector3 targetPos{};
+  Common::Vector3 targetRot{};
   uint32_t targetZone{128};
   float rotation = 0.0f;
 
@@ -357,7 +357,12 @@ void Sapphire::Network::GameConnection::setLanguageHandler( const Packets::FFXIV
 
   auto& teriMgr = Common::Service< TerritoryMgr >::ref();
   auto pCurrentZone = teriMgr.getTerritoryByGuId( player.getTerritoryId() );
-
+  if( !pCurrentZone )
+  {
+    Logger::error( "Invalid territory for player {}", player.getId() );
+    return; 
+  }
+  
   pCurrentZone->onFinishLoading( player );
 
   // player is done zoning
@@ -495,7 +500,7 @@ void Sapphire::Network::GameConnection::tellHandler( const Packets::FFXIVARR_PAC
 
   auto pTargetPlayer = playerMgr().getPlayer( data.toName );
 
-  if( !pTargetPlayer || pTargetPlayer->isConnected() )
+  if( !pTargetPlayer || !pTargetPlayer->isConnected() )
   {
     auto tellErrPacket = makeZonePacket< Packets::Server::FFXIVIpcTellNotFound >( player.getId() );
     strcpy( tellErrPacket->data().toName, data.toName );

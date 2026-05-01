@@ -39,6 +39,8 @@
 #include "Job/Warrior.h"
 #include "Job/Bard.h"
 
+#include "AI/TargetHelper.h"
+
 using namespace Sapphire;
 using namespace Sapphire::Common;
 using namespace Sapphire::Network;
@@ -96,7 +98,7 @@ bool Action::Action::init()
 
     m_actionData = actionData;
   }
-  auto teriMgr = Common::Service< Manager::TerritoryMgr >::ref();
+  auto& teriMgr = Common::Service< Manager::TerritoryMgr >::ref();
   auto zone = teriMgr.getTerritoryByGuId( m_pSource->getTerritoryId() );
   m_resultId = zone->getNextActionResultId();
 
@@ -108,7 +110,7 @@ bool Action::Action::init()
   m_effectWidth = m_actionData->data().EffectWidth;
   m_category = static_cast< Common::ActionCategory >( m_actionData->data().Category );
   m_castType = static_cast< Common::CastType >( m_actionData->data().EffectType );
-  m_aspect = static_cast< Common::ActionAspect >( m_actionData->data().AttackType );
+  m_aspect = static_cast< Common::ActionAspect >( m_actionData->data().Element );
 
   // todo: move this to bitset
   m_canTargetSelf = m_actionData->data().SelectMyself;
@@ -176,12 +178,12 @@ bool Action::Action::init()
   return true;
 }
 
-void Action::Action::setPos( const Common::FFXIVARR_POSITION3& pos )
+void Action::Action::setPos( const Common::Vector3& pos )
 {
   m_pos = pos;
 }
 
-const Common::FFXIVARR_POSITION3& Action::Action::getPos() const
+const Common::Vector3& Action::Action::getPos() const
 {
   return m_pos;
 }
@@ -214,6 +216,16 @@ bool Action::Action::hasClientsideTarget() const
 bool Action::Action::isInterrupted() const
 {
   return m_interruptType != Common::ActionInterruptType::None;
+}
+
+int Action::Action::getInterruptTickCount() const
+{
+  return m_interruptTickCount;
+}
+
+void Action::Action::addInterruptTickCount()
+{
+  m_interruptTickCount++;
 }
 
 Common::ActionInterruptType Action::Action::getInterruptType() const
@@ -249,6 +261,11 @@ bool Action::Action::isAbility() const
 bool Action::Action::isWeaponskill() const
 {
   return m_category == ActionCategory::Weaponskill;
+}
+
+bool Action::Action::isSpell() const
+{
+  return m_category == ActionCategory::Spell;
 }
 
 Entity::CharaPtr Action::Action::getSourceChara() const
@@ -289,7 +306,7 @@ bool Action::Action::update()
     }
 
     player->setLastActionTick( tickCount );
-    uint64_t delayMs = 100 - lastTickMs;
+    uint64_t delayMs = 100ull - lastTickMs;
     castTime = ( m_castTimeMs + delayMs );
     m_castTimeRestMs = static_cast< uint64_t >( m_castTimeMs ) - static_cast< uint64_t >( std::difftime( tickCount, startTime ) );
   }
@@ -417,13 +434,14 @@ void Action::Action::interrupt()
 
     // Note: When cast interrupt from taking too much damage, set the last value to 1.
     // This enables the cast interrupt effect.
+    // todo: use the correct interrupt effect for players locked out
     auto control = makeActorControl( m_pSource->getId(), ActorControlType::CastInterrupt, 0x219, 1, m_id, interruptEffect );
 
     server().queueForPlayers( m_pSource->getInRangePlayerIds( true ), control );
   }
 
   onInterrupt();
-
+  addInterruptTickCount();
 }
 
 void Action::Action::onInterrupt()
@@ -435,8 +453,23 @@ void Action::Action::onInterrupt()
 void Action::Action::execute()
 {
   assert( m_pSource );
+
+  bool shouldInterrupt = false;
+
   // subtract costs first, if somehow the caster stops meeting those requirements cancel the cast
   if( !consumeResources() )
+    shouldInterrupt = true;
+
+  if( m_pTarget )
+  {
+    if( m_pSource->getTerritoryId() != m_pTarget->getTerritoryId() )
+      shouldInterrupt = true;
+    // todo: is this correct?
+    if( m_pSource->getBoundEncounterId() != m_pTarget->getBoundEncounterId() )
+      shouldInterrupt = true;
+  }
+
+  if( shouldInterrupt )
   {
     interrupt();
     return;
@@ -453,8 +486,8 @@ void Action::Action::execute()
 
   if( isCorrectCombo() )
   {
-    auto player = m_pSource->getAsPlayer();
-    Manager::PlayerMgr::sendDebug( *player, "action combo success from action#{0}", player->getLastComboActionId() );
+    if( auto player = m_pSource->getAsPlayer() )
+      Manager::PlayerMgr::sendDebug( *player, "action combo success from action#{0}", player->getLastComboActionId() );
   }
 
   if( !hasClientsideTarget()  )
@@ -472,6 +505,8 @@ void Action::Action::execute()
     else // clear last combo action if the combo breaks
       m_pSource->setLastComboActionId( 0 );
   }
+
+  m_pSource->removeStatusEffectByFlag( Common::StatusEffectFlag::RemoveOnActionUse );
 }
 
 std::pair< uint32_t, Common::CalcResultType > Action::Action::calcDamage( uint32_t potency )
@@ -481,26 +516,46 @@ std::pair< uint32_t, Common::CalcResultType > Action::Action::calcDamage( uint32
     return std::make_pair( static_cast< uint32_t >( dmg.first ), dmg.second );
   };
 
-  // todo: what do for npcs?
-  auto wepDmg = 1.f;
+  Common::BaseParam calcStat = Common::BaseParam::Strength;
+  switch( static_cast< Common::ClassJob >( m_actionData->data().UseClassJob ) )
+  {
+    case Common::ClassJob::Conjurer:
+    case Common::ClassJob::Thaumaturge:
+    case Common::ClassJob::Whitemage:
+    case Common::ClassJob::Blackmage:
+    case Common::ClassJob::Arcanist:
+    case Common::ClassJob::Summoner:
+    case Common::ClassJob::Scholar:
+    case Common::ClassJob::Astrologian:
+    {
+      if( isSpell() || isAbility() )
+      {
+        calcStat = Common::BaseParam::Intelligence;
+      }
+      break;
+    }
+    default:
+    {
+      calcStat = Common::BaseParam::Strength;
+    }
+  }
+  if( calcStat == Common::BaseParam::Strength && m_pSource->getPrimaryStat() == Common::BaseParam::Dexterity )
+    calcStat = Common::BaseParam::Dexterity;
 
+  auto wepDmg = m_pSource->getPhysicalWeaponDamage();
+  // We assume that the attack scales with magical weapon damage if the main stat of the attack is INT (probably for MND too but there shouldn't be any attacks that scale with MNDs)
+  if( calcStat == Common::BaseParam::Intelligence )
+    wepDmg = m_pSource->getMagicalWeaponDamage();
+
+
+  // todo: do we still need that player check for auto attacks?
   if( auto player = m_pSource->getAsPlayer() )
   {
-    auto item = player->getEquippedWeapon();
-    assert( item );
-
-    auto role = player->getRole();
-    if( role == Common::Role::RangedMagical || role == Common::Role::Healer )
-      wepDmg = item->getMagicalDmg();
-    else
-      wepDmg = item->getPhysicalDmg();
-
     // is auto attack
     if( getId() == 7 || getId() == 8 )
-      return truncate( Math::CalcStats::calcAutoAttackDamage( *m_pSource->getAsPlayer() ) );
+      return truncate( Math::CalcStats::calcAutoAttackDamage( *m_pSource->getAsPlayer(), calcStat, wepDmg ) );
   }
-
-  return truncate( Math::CalcStats::calcActionDamage( *m_pSource, potency, wepDmg ) );
+  return truncate( Math::CalcStats::calcActionDamage( *m_pSource, potency, calcStat, wepDmg, static_cast< uint8_t >( m_aspect ) ) );
 }
 
 std::pair< uint32_t, Common::CalcResultType > Action::Action::calcHealing( uint32_t potency )
@@ -675,7 +730,7 @@ void Action::Action::applyStatusEffect( bool isSelf, Entity::CharaPtr& target, E
       if( ( status.flag & static_cast< uint32_t >( Common::StatusEffectFlag::ReplaceSameCaster ) && hasSameStatusFromSameCaster ) || hasSameStatus )
         pActionBuilder->replaceStatusEffect( referenceStatus, target, status.id, status.duration, 0, std::move( status.modifiers ), status.flag, statusToSource, status.groundAOE );
       else
-        pActionBuilder->applyStatusEffect( target, status.id, status.duration, 0, std::move( status.modifiers ), status.flag, statusToSource, true, status.groundAOE );
+        pActionBuilder->applyStatusEffect( target, status.id, status.duration, 0, status.modifiers, status.flag, statusToSource, true, status.groundAOE );
       break;
     }
     case Common::StatusRefreshPolicy::Extend:
@@ -739,7 +794,7 @@ void Action::Action::handleStatusEffects()
         if( status.groundAOE.aoeType == GroundAOEType::Damage )
           m_pSource->createAreaObject( getId(), m_lutEntry.potency, status.groundAOE.vfxId, m_actionData->data().EffectRange, m_pos );
         else
-          m_pSource->createAreaObject( getId(), m_lutEntry.curePotency, status.groundAOE.vfxId, m_actionData->data().EffectRange, m_pos );     
+          m_pSource->createAreaObject( getId(), m_lutEntry.curePotency, status.groundAOE.vfxId, m_actionData->data().EffectRange, m_pos );
       }
       applyStatusEffect( true, m_pSource, m_pSource, status, true );
         // pActionBuilder->applyStatusEffectSelf( status.id, status.duration, 0, std::move( status.modifiers ), status.flag, true );
@@ -762,18 +817,22 @@ void Action::Action::handleStatusEffects()
 
 void Action::Action::handleJobAction()
 {
-  switch( m_pSource->getClass() )
+  // todo: this really shouldn't use getAsPlayer and treat as any actor. leaving explicit isPlayer check
+  if( auto pPlayer = m_pSource->getAsPlayer() )
   {
-    case ClassJob::Warrior:
+    switch( m_pSource->getClass() )
     {
-      Warrior::onAction( *m_pSource->getAsPlayer(), *this );
-      break;
-    }
-    case ClassJob::Archer:
-    case ClassJob::Bard:
-    {
-      Bard::onAction( *m_pSource->getAsPlayer(), *this );
-      break;
+      case ClassJob::Warrior:
+      {
+        Warrior::onAction( *pPlayer, *this );
+        break;
+      }
+      case ClassJob::Archer:
+      case ClassJob::Bard:
+      {
+        Bard::onAction( *pPlayer, *this );
+        break;
+      }
     }
   }
 }
@@ -887,8 +946,13 @@ bool Action::Action::primaryCostCheck( bool subtractCosts )
     case Common::ActionPrimaryCostType::MagicPoints:
     {
       auto curMp = m_pSource->getMp();
-
+      
       auto cost = Math::CalcStats::calculateMpCost( *m_pSource, m_primaryCost );
+
+      // Elemental aspect cost modifiers.
+      // Modifier order is the same as the action aspect order, so we can just add the action aspect to the enum value of the first modifier to get the correct one.
+      auto modifier = static_cast< Common::ParamModifier >( static_cast< uint16_t >( Common::ParamModifier::ElementalNoneMpCostPercent ) + static_cast< uint8_t >( m_aspect ) );
+      cost *=  m_pSource->getModifier( modifier );
 
       if( curMp < static_cast< uint32_t >( cost ) )
         return false;
@@ -982,36 +1046,40 @@ void Action::Action::addDefaultActorFilters()
 {
   switch( m_castType )
   {
-    // todo: figure these out and remove 5/RectangularAOE to own handler
-    case( Common::CastType ) 5:
     case Common::CastType::SingleTarget:
     {
       auto filter = std::make_shared< World::Util::ActorFilterSingleTarget >( static_cast< uint32_t >( m_targetId ) );
       addActorFilter( filter );
       break;
     }
-
+    // todo: what is this CastType::Unknown (5)? seems to be another circular aoe?
+    case Common::CastType::Unknown:
     case Common::CastType::Circle:
     {
-      auto filter = std::make_shared< World::Util::ActorFilterInRange >( m_pos, m_effectRange );
+      auto filter = std::make_shared< World::Util::ActorFilterInRange >( m_pos, m_effectRange + m_pSource->getRadius() );
       addActorFilter( filter );
       break;
     }
     case Common::CastType::Box:
     {
-      auto filter = std::make_shared< World::Util::ActorFilterBox >( m_pos, m_effectWidth, m_effectRange );
+      auto filter = std::make_shared< World::Util::ActorFilterBox >( m_pos, m_effectWidth, m_effectRange + m_pSource->getRadius() );
       addActorFilter( filter );
       break;
     }
     case Common::CastType::Cone:
     {
+      // todo: account for Caster radius and Target radius
       ConeEntry shapeEntry = { 0, 0 };
       if( ActionShapeLut::validConeEntryExists( static_cast< uint16_t >( getId() ) ) )
       {
         shapeEntry = ActionShapeLut::getConeEntry( static_cast< uint16_t >( getId() ) );
       }
 
-      auto rangeFilter = std::make_shared< World::Util::ActorFilterInRange >( m_pSource->getPos(), m_range );
+      auto p1 = m_pSource->getPos();
+      auto p2 = m_pos;
+      Logger::debug( "Action#{} Range:{} EffectRange:{} EffectWidth:{} SrcPos:({},{},{}) Pos:({},{},{}) ", m_id, m_range, m_effectRange, m_effectWidth, p1.x, p1.y, p1.z, p2.x, p2.y, p2.z );
+
+      auto rangeFilter = std::make_shared< World::Util::ActorFilterInRange >( m_pSource->getPos(), m_effectRange + m_pSource->getRadius() );
       addActorFilter( rangeFilter );
       auto coneFilter = std::make_shared< World::Util::ActorFilterCone >( m_pSource->getPos(), m_pos, shapeEntry.startAngle, shapeEntry.endAngle );
       addActorFilter( coneFilter );
@@ -1036,14 +1104,20 @@ void Action::Action::addDefaultActorFilters()
 
 bool Action::Action::preFilterActor( Entity::GameObject& actor ) const
 {
-  if( m_castType == Common::CastType::SingleTarget ) // client filters any single target action by itself
+  if( m_castType == Common::CastType::SingleTarget && m_pSource->isPlayer() ) // client filters any single target action by itself
     return true;
 
   auto kind = actor.getObjKind();
-  auto chara = actor.getAsChara();
+  auto pChara = actor.getAsChara();
+  auto pSrc = m_pSource->getAsChara();
 
   // todo: are there any server side eobjs that players can hit?
   if( kind != ObjKind::BattleNpc && kind != ObjKind::Player )
+    return false;
+
+  // todo: is this correct?
+  auto pEncounterFilter = std::make_shared< World::AI::SameEncounterFilter >();
+  if( !pEncounterFilter->isApplicable( pSrc, pChara ) )
     return false;
 
   bool actorApplicable = false;
@@ -1056,13 +1130,16 @@ bool Action::Action::preFilterActor( Entity::GameObject& actor ) const
     }
     case Common::TargetFilter::Players:
     {
+      // todo: should pets fall under TargetFilter::Players or Allies?
       actorApplicable = kind == ObjKind::Player;
       break;
     }
     case Common::TargetFilter::Allies:
     {
-      // Todo: Make this work for allies properly
-      actorApplicable = kind != ObjKind::BattleNpc;
+      if( kind == ObjKind::Player )
+        actorApplicable = true;
+      else if( kind == ObjKind::BattleNpc && pChara->getAsBNpc()->getEnemyType() == 0 )
+        actorApplicable = true;
       break;
     }
     case Common::TargetFilter::Party:
@@ -1088,15 +1165,15 @@ bool Action::Action::preFilterActor( Entity::GameObject& actor ) const
     }
     case Common::TargetFilter::Enemies:
     {
-      actorApplicable = kind == ObjKind::BattleNpc;
+      actorApplicable = kind == ObjKind::BattleNpc && pChara->getAsBNpc()->getEnemyType() != 0;
       break;
     }
   }
   
-  if( chara->isAlive() && ( m_lutEntry.curePotency > 0 || m_canTargetFriendly ) && m_pSource->isFriendly( *chara ) )
+  if( pChara->isAlive() && ( m_lutEntry.curePotency > 0 || m_canTargetFriendly ) && m_pSource->isFriendly( *pChara ) )
     return actorApplicable;
 
-  if( chara->isAlive() && ( m_lutEntry.potency > 0 || m_canTargetHostile ) && m_pSource->isHostile( *chara ) )
+  if( pChara->isAlive() && ( m_lutEntry.potency > 0 || m_canTargetHostile ) && m_pSource->isHostile( *pChara ) )
     return actorApplicable;
 
   return false;

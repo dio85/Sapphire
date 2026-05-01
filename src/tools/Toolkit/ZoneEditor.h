@@ -1,9 +1,13 @@
 #pragma once
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 #include <string>
 #include <memory>
 #include <set>
+#include <filesystem>
+#include <regex>
+#include <optional>
 #include "commonshader.h"
 #include "Exd/ExdData.h"
 #include "glm/vec2.hpp"
@@ -16,6 +20,25 @@
 #include "DetourNavMesh.h"
 #include "DetourNavMeshQuery.h"
 
+
+struct CachedEObjCollision
+{
+  std::string eobjName;
+  uint32_t baseId{ 0 };
+  uint32_t instanceId{ 0 };
+  // eobj world origin (for position marker)
+  glm::vec3 eobjPos{ 0.f, 0.f, 0.f };
+  float eobjRot{ 0.f };
+  // collision shape type (should just use Sapphire::Entity::EventObjectCollisionType tbh)
+  enum class ShapeType : uint32_t { Box = 1, Sphere = 3, Cylinder = 4 } type{ ShapeType::Box };
+  // collision shape world position / orientation
+  glm::vec3 collPos{ 0.f, 0.f, 0.f };
+  float collRot{ 0.f };
+  // box half-extents (already full w/h/d stored; halved in geometry parser)
+  float width{ 1.f }, height{ 1.f }, depth{ 1.f };
+  // cylinder / sphere
+  float radius{ 1.f }, cylinderH{ 1.f };
+};
 
 struct CachedServerPath
 {
@@ -201,6 +224,45 @@ private:
     int triangleIndex = -1;
   };
 
+  struct ArenaBarrierEdge
+  {
+    dtPolyRef polyRef{ 0 };
+    uint8_t edgeIndex{ 0 };
+    dtPolyRef neighborRef{ 0 };
+  };
+
+  struct ArenaBarrierLine
+  {
+    int collisionIndex{ -1 };
+    uint32_t eobjInstanceId{ 0 };
+    uint32_t eobjBaseId{ 0 };
+    glm::vec3 pointA{ 0.f, 0.f, 0.f };
+    glm::vec3 pointB{ 0.f, 0.f, 0.f };
+    std::vector< ArenaBarrierEdge > mappedEdges;
+  };
+
+  struct ArenaRegion
+  {
+    std::unordered_set< dtPolyRef > visitedPolys;
+    std::vector< glm::vec2 > convexHull2D;
+    std::vector< glm::vec2 > clippedHull2D;
+    bool hasYRange{ false };
+    float minY{ 0.0f };
+    float maxY{ 0.0f };
+  };
+
+  struct ArenaGenerationResult
+  {
+    bool ok{ false };
+    std::string error;
+    std::vector< std::string > warnings;
+    std::vector< ArenaBarrierLine > lines;
+    ArenaRegion region;
+    glm::vec3 anchor{ 0.f, 0.f, 0.f };
+    dtPolyRef startPoly{ 0 };
+    uint64_t navmeshFingerprint{ 0 };
+  };
+
   // Ray casting methods
   Ray screenToWorldRay( const ImVec2& screenPos, const ImVec2& imageSize );
 
@@ -216,10 +278,49 @@ private:
 
   void renderWorldMarker( const glm::vec3& worldPos );
 
+  void clearArenaGenerationState();
+  std::vector< int > collectLineCollisionCandidates() const;
+  std::optional< std::pair< glm::vec3, glm::vec3 > > resolveLineEndpointsFromCollisionIndex( int collisionIndex ) const;
+  std::optional< dtPolyRef > findNearestPolyForPoint( const glm::vec3& worldPos, const float* extents,
+                                                      float* nearestOut = nullptr ) const;
+  std::optional< ArenaBarrierEdge > findNearestEdgeOnPoly( dtPolyRef polyRef, const glm::vec3& worldPos,
+                                                           float maxEdgeDist ) const;
+  bool expandBarrierToTwinEdge( const ArenaBarrierEdge& src, ArenaBarrierEdge& dst ) const;
+  bool isBarrierEdge( dtPolyRef polyRef, uint8_t edgeIndex ) const;
+  uint64_t makeBarrierEdgeKey( dtPolyRef polyRef, uint8_t edgeIndex ) const;
+  ArenaRegion floodFillRegion( dtPolyRef startPoly ) const;
+  std::vector< glm::vec2 > buildConvexHull2D( const std::vector< glm::vec2 >& points ) const;
+  std::vector< glm::vec2 > clipHullBySelectedLines( const std::vector< glm::vec2 >& hull,
+                                                    const glm::vec2& anchorXZ,
+                                                    std::vector< std::string >& warnings ) const;
+  void buildHybridHullFromRegion( ArenaGenerationResult& result ) const;
+  bool isPointInsideConvexPolygon2D( const std::vector< glm::vec2 >& polygon, const glm::vec2& point ) const;
+  bool isPointInsideArenaPolyfill( const glm::vec3& worldPos ) const;
+  ArenaGenerationResult generateArenaRegion();
+  bool exportArenaGenerationJson( const ArenaGenerationResult& result );
+  uint64_t computeNavmeshFingerprint() const;
+  void renderArenaOverlay( ImDrawList* drawList, const ImVec2& imagePos, const ImVec2& imageSize );
+
   // World editing state
   bool m_worldEditingMode = false;
   glm::vec3 m_lastClickWorldPos = glm::vec3( 0.0f );
   bool m_showClickMarker = false;
+  bool m_arenaPickAnchorMode{ false };
+  bool m_arenaAnchorSet{ false };
+  bool m_arenaShowRegionOverlay{ true };
+  bool m_arenaShowBarrierOverlay{ true };
+  float m_arenaEdgeSnapMaxDistance{ 2.5f };
+  float m_arenaPolySnapExtentXZ{ 2.5f };
+  float m_arenaPolySnapExtentY{ 6.0f };
+  float m_arenaHybridObjMarginXZ{ 18.0f };
+  float m_arenaHybridObjYTolerance{ 16.0f };
+  bool m_arenaUseYGate{ false };
+  glm::vec3 m_arenaAnchor{ 0.f, 0.f, 0.f };
+  std::set< int > m_arenaSelectedCollisionIndices;
+  std::unordered_set< uint64_t > m_arenaBarrierEdgeKeys;
+  std::vector< ArenaBarrierEdge > m_arenaBarrierEdges;
+  ArenaGenerationResult m_arenaResult;
+  std::string m_arenaLastExportPath;
   bool m_showServerPathWindow = true;
   uint32_t m_selectedServerPathId = 0;
   GLuint m_serverPathVAO = 0;
@@ -234,6 +335,39 @@ private:
   GLuint m_serverPathShader = 0;
 
   void renderServerPaths();
+
+  // ---- EObj collision visualisation ----
+  std::vector< CachedEObjCollision > m_cachedEObjCollisions;
+
+  // VAO/VBO for collision shape wireframes (boxes/cylinders/spheres)
+  GLuint m_eobjCollisionVAO{ 0 };
+  GLuint m_eobjCollisionVBO{ 0 };
+  int    m_eobjCollisionVertexCount{ 0 };
+
+  // VAO/VBO for EObj origin marker crosses
+  GLuint m_eobjMarkerVAO{ 0 };
+  GLuint m_eobjMarkerVBO{ 0 };
+  int    m_eobjMarkerVertexCount{ 0 };
+
+  bool m_showEObjCollisions{ true };
+  bool m_showEObjMarkers{ true };
+
+  // Path of the last successfully parsed script
+  std::string m_loadedScriptPath;
+  char        m_scriptPathBuffer[ 512 ]{};
+
+  // One-time index: InstanceContentScript id  →  source file path
+  std::unordered_map< uint32_t, std::filesystem::path > m_scriptIndexCache;
+  bool m_scriptIndexBuilt{ false };
+
+  void buildScriptIndexCache();
+  void autoDetectInstanceScript();
+  void parseInstanceScript( const std::filesystem::path& path );
+  void buildEObjCollisionGeometry();
+  void buildEObjMarkerGeometry();
+  void renderEObjCollisions();
+  void renderEObjMarkers();
+  void cleanupEObjRendering();
 
 
   // Camera/view controls for navmesh
@@ -439,8 +573,11 @@ public:
   float m_mapScale = 100.0f; // You'll need to get this from the map data
   ImVec2 m_mapOffset = ImVec2( 1024.0f, 1024.0f ); // Default offset
 
+  bool m_showNavCameraOnMap = true;
+
   // Helper methods
   void drawBnpcIcons();
+  void drawNavCameraOnMap( const ImVec2& imagePos, const ImVec2& imageSize );
 
   ImVec2 worldToScreenPos( float worldX, float worldZ, const ImVec2& imagePos, const ImVec2& imageSize );
 

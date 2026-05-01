@@ -816,7 +816,7 @@ namespace Sapphire::Common
   {
     uint32_t id;
     uint32_t teri;
-    FFXIVARR_POSITION3 pos;
+    Vector3 pos;
     float radius;
   };
 
@@ -930,7 +930,32 @@ namespace Sapphire::Common
     PiercingResistancePercent = 1028,
     BluntResistancePercent = 1029,
     ProjectileResistancePercent = 1030,
-    ParryPercent = 1031
+    ParryPercent = 1031,
+
+    // Elemental damage modifiers, order is preserved from ActionAspect, do not change or place something else inbetween unless you know what you're doing. 
+    // These are used as positions to offset ActionAspect from, so they need to be in a contiguous block.
+    ElementalNoneDamagePercent = 1032,
+    ElementalFireDamagePercent = 1033,
+    ElementalIceDamagePercent = 1034,
+    ElementalWindDamagePercent = 1035,
+    ElementalEarthDamagePercent = 1036,
+    ElementalLightningDamagePercent = 1037,
+    ElementalWaterDamagePercent = 1038,
+    ElementalUnaspectedDamagePercent = 1039,
+
+    MpRestRegenSuppressed = 1040,
+    MpRestRegenPercent = 1041,
+
+    // Elemental mp cost modifiers, order is preserved from ActionAspect, do not change or place something else inbetween unless you know what you're doing. 
+    // These are used as positions to offset ActionAspect from, so they need to be in a contiguous block.
+    ElementalNoneMpCostPercent = 1100,
+    ElementalFireMpCostPercent = 1101,
+    ElementalIceMpCostPercent = 1102,
+    ElementalWindMpCostPercent = 1103,
+    ElementalEarthMpCostPercent = 1104,
+    ElementalLightningMpCostPercent = 1105,
+    ElementalWaterMpCostPercent = 1106,
+    ElementalUnaspectedMpCostPercent = 1107,
   };
 
   enum class StatusEffectFlag : uint32_t
@@ -950,7 +975,8 @@ namespace Sapphire::Common
     RemoveOnSuccessfulHit = 0x1000,
     ReplaceSameCaster = 0x2000,
     GroundTarget = 0x4000,
-    RemoveOnDeath = 0x8000
+    RemoveOnDeath = 0x8000,
+    RemoveOnActionUse = 0x10000
   };
 
   enum class StatusRefreshPolicy : uint8_t

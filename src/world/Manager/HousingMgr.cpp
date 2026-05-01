@@ -120,6 +120,8 @@ bool HousingMgr::loadEstateInventories()
 
   auto stmt = db.getPreparedStatement( Db::LAND_INV_SEL_ALL );
   auto res = db.query( stmt );
+  if( !res )
+    return false;
 
   uint32_t itemCount = 0;
   while( res->next() )
@@ -178,6 +180,8 @@ void HousingMgr::initLandCache()
 
   auto stmt = db.getPreparedStatement( Db::LAND_SEL_ALL );
   auto res = db.query( stmt );
+  if( !res )
+    return;
 
   while( res->next() )
   {
@@ -278,7 +282,7 @@ uint64_t HousingMgr::getNextHouseId()
   auto& db = Common::Service< Db::DbWorkerPool< Db::ZoneDbConnection > >::ref();
   auto pQR = db.query( "SELECT MAX( HouseId ) FROM house" );
 
-  if( !pQR->next() )
+  if( !pQR || !pQR->next() )
     return 0;
 
   return pQR->getUInt64( 1 ) + 1;
@@ -295,7 +299,7 @@ LandPtr HousingMgr::getLandByOwnerId( uint64_t id )
   auto& db = Common::Service< Db::DbWorkerPool< Db::ZoneDbConnection > >::ref();
   auto res = db.query( "SELECT LandSetId, LandId FROM land WHERE OwnerId = " + std::to_string( id ) );
 
-  if( !res->next() )
+  if( !res || !res->next() )
     return nullptr;
 
   auto& teriMgr = Common::Service< TerritoryMgr >::ref();
@@ -362,6 +366,9 @@ void HousingMgr::sendLandSignFree( Entity::Player& player, const Common::LandIde
     return;
 
   auto land = hZone->getLand( static_cast< uint8_t >( ident.landId ) );
+  if( !land )
+    return;
+
   auto plotPricePacket = makeZonePacket< FFXIVIpcHousingAuction >( player.getId() );
   plotPricePacket->data().Price = land->getCurrentPrice();
   plotPricePacket->data().Timer = land->getDevaluationTime();
@@ -371,13 +378,12 @@ void HousingMgr::sendLandSignFree( Entity::Player& player, const Common::LandIde
 
 LandPurchaseResult HousingMgr::purchaseLand( Entity::Player& player, HousingZone& zone, uint16_t plot, uint8_t state )
 {
-
-  auto plotPrice = zone.getLand( plot )->getCurrentPrice();
-  auto gilAvailable = player.getCurrency( Common::CurrencyType::Gil );
   auto pLand = zone.getLand( plot );
-
   if( !pLand )
     return LandPurchaseResult::ERR_INTERNAL;
+
+  auto plotPrice = pLand->getCurrentPrice();
+  auto gilAvailable = player.getCurrency( Common::CurrencyType::Gil );
 
   if( pLand->getStatus() != Common::HouseStatus::ForSale )
     return LandPurchaseResult::ERR_NOT_AVAILABLE;
@@ -428,8 +434,7 @@ bool HousingMgr::relinquishLand( Entity::Player& player, HousingZone& zone, uint
   // TODO: Add checks for land state before relinquishing
 
   auto pLand = zone.getLand( plot );
-  auto plotMaxPrice = pLand->getCurrentPrice();
-
+  
   // can't relinquish when you are not the owner
   // TODO: actually use permissions here for FC houses
   if( !pLand || !hasPermission( player, *pLand, 0 ) )
@@ -445,6 +450,8 @@ bool HousingMgr::relinquishLand( Entity::Player& player, HousingZone& zone, uint
     Network::Util::Packet::sendActorControlSelf( player, player.getId(), ActorControl::LogMsg, 3315 );
     return false;
   }
+
+  auto plotMaxPrice = pLand->getCurrentPrice();
 
   pLand->setCurrentPrice( pLand->getMaxPrice() );
   pLand->setOwnerId( 0 );
@@ -740,6 +747,8 @@ void HousingMgr::requestEstateRename( Entity::Player& player, const Common::Land
     return;
 
   auto land = hZone->getLand( static_cast< uint8_t >( ident.landId ) );
+  if( !land )
+    return;
 
   auto house = land->getHouse();
   if( !house )
@@ -931,9 +940,9 @@ void HousingMgr::updateHouseModels( HousePtr house )
       // but the models array starts from the 2nd entry of the enum
       // so we skip the first one, and then any subsequent entries is slotid - 1
 
-      auto slotId = item.first - 1;
-      if( slotId < 0 )
+      if( item.first == 0 )
         continue;
+      auto slotId = static_cast< uint16_t >( item.first - 1 );
 
       house->setExteriorModel( static_cast< Common::HouseExteriorSlot >( slotId ),
                                getItemAdditionalData( item.second->getId() ), item.second->getStain() );
@@ -977,7 +986,7 @@ bool HousingMgr::isPlacedItemsInventory( Sapphire::Common::InventoryType type )
 }
 
 void HousingMgr::reqPlaceHousingItem( Entity::Player& player, uint16_t landId, uint16_t containerId, uint8_t slotId,
-                                      Common::FFXIVARR_POSITION3 pos, float rotation )
+                                      Common::Vector3 pos, float rotation )
 {
   auto& server = Common::Service< World::WorldServer >::ref();
   auto& teriMgr = Common::Service< TerritoryMgr >::ref();
@@ -1082,11 +1091,13 @@ void HousingMgr::reqPlaceItemInStore( Entity::Player& player, uint16_t landId, u
 
     auto pTeri = teriMgr.getTerritoryByGuId( landSetId );
     auto hZone = std::dynamic_pointer_cast< HousingZone >( pTeri );
+    if( !hZone )
+      return;
 
     land = hZone->getLand( static_cast< uint8_t >( ident.landId ) );
   }
 
-  if( !hasPermission( player, *land, 0 ) )
+  if( !land || !hasPermission( player, *land, 0 ) )
     return;
 
   auto& invMgr = Common::Service< InventoryMgr >::ref();
@@ -1262,7 +1273,7 @@ void HousingMgr::sendInternalEstateInventoryBatch( Entity::Player& player, bool 
   }
 }
 
-void HousingMgr::reqMoveHousingItem( Entity::Player& player, Common::LandIdent ident, uint8_t slot, Common::FFXIVARR_POSITION3 pos, float rot )
+void HousingMgr::reqMoveHousingItem( Entity::Player& player, Common::LandIdent ident, uint8_t slot, Common::Vector3 pos, float rot )
 {
   auto landSetId = toLandSetId( ident.territoryTypeId, ident.wardNum );
 
@@ -1289,7 +1300,7 @@ void HousingMgr::reqMoveHousingItem( Entity::Player& player, Common::LandIdent i
 }
 
 bool HousingMgr::moveInternalItem( Entity::Player& player, Common::LandIdent ident, Territory::Housing::HousingInteriorTerritory& terri, uint8_t slot,
-                                   Common::FFXIVARR_POSITION3 pos, float rot )
+                                   Common::Vector3 pos, float rot )
 {
   auto& server = Common::Service< World::WorldServer >::ref();
 
@@ -1335,7 +1346,7 @@ bool HousingMgr::moveInternalItem( Entity::Player& player, Common::LandIdent ide
   return true;
 }
 
-bool HousingMgr::moveExternalItem( Entity::Player& player, Common::LandIdent ident, uint8_t slot, HousingZone& terri, Common::FFXIVARR_POSITION3 pos, float rot )
+bool HousingMgr::moveExternalItem( Entity::Player& player, Common::LandIdent ident, uint8_t slot, HousingZone& terri, Common::Vector3 pos, float rot )
 {
   auto& server = Common::Service< World::WorldServer >::ref();
 
