@@ -135,6 +135,9 @@ namespace Sapphire::Db
     ACCOUNT_INS,
     CHARA_SEL_BY_ACCOUNT_ID,
     CHARA_SEL_BY_NAME,
+    LOOT_SEL_TABLES,
+    LOOT_SEL_POOLS,
+    LOOT_SEL_ITEMS,
 
     MAX_STATEMENTS
   };

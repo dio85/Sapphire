@@ -125,16 +125,23 @@ inline unsigned int ilog2( uint32_t v )
 {
   uint32_t r;
   uint32_t shift;
-  r = (v > 0xffff) << 4; v >>= r;
-  shift = (v > 0xff) << 3; v >>= shift; r |= shift;
-  shift = (v > 0xf) << 2; v >>= shift; r |= shift;
-  shift = (v > 0x3) << 1; v >>= shift; r |= shift;
-  r |= (v >> 1);
+  r = ( v > 0xffff ) << 4;
+  v >>= r;
+  shift = ( v > 0xff ) << 3;
+  v >>= shift;
+  r |= shift;
+  shift = ( v > 0xf ) << 2;
+  v >>= shift;
+  r |= shift;
+  shift = ( v > 0x3 ) << 1;
+  v >>= shift;
+  r |= shift;
+  r |= ( v >> 1 );
   return r;
 }
 
 void MeshProcess::process( struct dtNavMeshCreateParams* params,
-                      unsigned char* polyAreas, unsigned short* polyFlags )
+                           unsigned char* polyAreas, unsigned short* polyFlags )
 {
   // Update poly flags from areas.
   for( int i = 0; i < params->polyCount; ++i )
@@ -161,8 +168,8 @@ void MeshProcess::process( struct dtNavMeshCreateParams* params,
   // Pass in off-mesh connections.
   if( m_geom )
   {
-    params->offMeshConVerts = m_geom->offmeshConnVerts.data();//getOffMeshConnectionVerts();
-    params->offMeshConRad = m_geom->offmeshConnRadius.data(); //getOffMeshConnectionRads();
+    params->offMeshConVerts = m_geom->offmeshConnVerts.data();      //getOffMeshConnectionVerts();
+    params->offMeshConRad = m_geom->offmeshConnRadius.data();       //getOffMeshConnectionRads();
     params->offMeshConDir = m_geom->offmeshConnBidirectional.data();//offmeshConnBidirectional();//getOffMeshConnectionDirs();
     params->offMeshConAreas = m_geom->offmeshConnArea.data();       //getOffMeshConnectionAreas();
     params->offMeshConFlags = m_geom->offmeshConnFlags.data();      //getOffMeshConnectionFlags();
@@ -244,7 +251,7 @@ TiledNavmeshGenerator::~TiledNavmeshGenerator()
   if( m_mesh )
     delete m_mesh;
 
-  if( m_chunkyMesh)
+  if( m_chunkyMesh )
     delete m_chunkyMesh;
 
   if( m_triareas )
@@ -266,7 +273,7 @@ TiledNavmeshGenerator::~TiledNavmeshGenerator()
   if( m_solid )
     rcFreeHeightField( m_solid );
   if( m_chf )
-    rcFreeCompactHeightfield(m_chf);
+    rcFreeCompactHeightfield( m_chf );
   if( m_pmesh )
     rcFreePolyMesh( m_pmesh );
   if( m_dmesh )
@@ -774,12 +781,36 @@ bool TiledNavmeshGenerator::buildTiledCache()
 unsigned char* TiledNavmeshGenerator::buildTileMesh( const int tx, const int ty, const float* bmin, const float* bmax,
                                                      int& dataSize )
 {
-  if( m_solid ) { rcFreeHeightField( m_solid ); m_solid = nullptr; }
-  if( m_triareas ) { delete[] m_triareas; m_triareas = nullptr; }
-  if( m_chf ) { rcFreeCompactHeightfield( m_chf ); m_chf = nullptr; }
-  if( m_cset ) { rcFreeContourSet( m_cset ); m_cset = nullptr; }
-  if( m_pmesh ) { rcFreePolyMesh( m_pmesh ); m_pmesh = nullptr; }
-  if( m_dmesh ) { rcFreePolyMeshDetail( m_dmesh ); m_dmesh = nullptr; }
+  if( m_solid )
+  {
+    rcFreeHeightField( m_solid );
+    m_solid = nullptr;
+  }
+  if( m_triareas )
+  {
+    delete[] m_triareas;
+    m_triareas = nullptr;
+  }
+  if( m_chf )
+  {
+    rcFreeCompactHeightfield( m_chf );
+    m_chf = nullptr;
+  }
+  if( m_cset )
+  {
+    rcFreeContourSet( m_cset );
+    m_cset = nullptr;
+  }
+  if( m_pmesh )
+  {
+    rcFreePolyMesh( m_pmesh );
+    m_pmesh = nullptr;
+  }
+  if( m_dmesh )
+  {
+    rcFreePolyMeshDetail( m_dmesh );
+    m_dmesh = nullptr;
+  }
 
   const float* verts = m_mesh->getVerts();
   const int nverts = m_mesh->getVertCount();
@@ -795,11 +826,11 @@ unsigned char* TiledNavmeshGenerator::buildTileMesh( const int tx, const int ty,
   m_cfg.walkableRadius = static_cast< int >( ceilf( m_agentRadius / m_cfg.cs ) );
   m_cfg.maxEdgeLen = static_cast< int >( m_edgeMaxLen / m_cellSize );
   m_cfg.maxSimplificationError = m_edgeMaxError;
-  m_cfg.minRegionArea = static_cast< int >( rcSqr( m_regionMinSize ) ); // Note: area = size*size
-  m_cfg.mergeRegionArea = static_cast< int >( rcSqr( m_regionMergeSize ) ); // Note: area = size*size
+  m_cfg.minRegionArea = static_cast< int >( rcSqr( m_regionMinSize ) );    // Note: area = size*size
+  m_cfg.mergeRegionArea = static_cast< int >( rcSqr( m_regionMergeSize ) );// Note: area = size*size
   m_cfg.maxVertsPerPoly = static_cast< int >( m_vertsPerPoly );
   m_cfg.tileSize = static_cast< int >( m_tileSize );
-  m_cfg.borderSize = m_cfg.walkableRadius + 3; // Reserve enough padding.
+  m_cfg.borderSize = m_cfg.walkableRadius + 3;// Reserve enough padding.
   m_cfg.width = m_cfg.tileSize + m_cfg.borderSize * 2;
   m_cfg.height = m_cfg.tileSize + m_cfg.borderSize * 2;
   m_cfg.detailSampleDist = m_detailSampleDist < 0.9f ? 0 : m_cellSize * m_detailSampleDist;
@@ -862,8 +893,8 @@ unsigned char* TiledNavmeshGenerator::buildTileMesh( const int tx, const int ty,
   tbmax[ 0 ] = m_cfg.bmax[ 0 ];
   tbmax[ 1 ] = m_cfg.bmax[ 2 ];
 
-  std::vector<int> cid( m_chunkyMesh->nnodes );
-  const int ncid = rcGetChunksOverlappingRect( m_chunkyMesh, tbmin, tbmax, cid.data(), static_cast<int>(cid.size()) );
+  std::vector< int > cid( m_chunkyMesh->nnodes );
+  const int ncid = rcGetChunksOverlappingRect( m_chunkyMesh, tbmin, tbmax, cid.data(), static_cast< int >( cid.size() ) );
 
   if( !ncid )
   {
@@ -926,9 +957,9 @@ unsigned char* TiledNavmeshGenerator::buildTileMesh( const int tx, const int ty,
   }
 
   // (Optional) Mark areas.
-//  const ConvexVolume* vols = m_mesh->getConvexVolumes();
-//  for (int i  = 0; i < m_geom->getConvexVolumeCount(); ++i)
-//    rcMarkConvexPolyArea(m_ctx, vols[i].verts, vols[i].nverts, vols[i].hmin, vols[i].hmax, (unsigned char)vols[i].area, *m_chf);
+  //  const ConvexVolume* vols = m_mesh->getConvexVolumes();
+  //  for (int i  = 0; i < m_geom->getConvexVolumeCount(); ++i)
+  //    rcMarkConvexPolyArea(m_ctx, vols[i].verts, vols[i].nverts, vols[i].hmin, vols[i].hmax, (unsigned char)vols[i].area, *m_chf);
 
   // Partition the heightfield so that we can use simple algorithm later to triangulate the walkable areas.
   // There are 3 martitioning methods, each with some pros and cons:
@@ -982,7 +1013,7 @@ unsigned char* TiledNavmeshGenerator::buildTileMesh( const int tx, const int ty,
       return nullptr;
     }
   }
-  else // SAMPLE_PARTITION_LAYERS
+  else// SAMPLE_PARTITION_LAYERS
   {
     // Partition the walkable surface into simple regions without holes.
     if( !rcBuildLayerRegions( m_ctx, *m_chf, m_cfg.borderSize, m_cfg.minRegionArea ) )

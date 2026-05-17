@@ -10,7 +10,7 @@ namespace Sapphire::World
   class LootBNpcTask : public Task
   {
   public:
-    LootBNpcTask( Entity::Player& player, std::string lootTable, uint64_t delayTime );
+    LootBNpcTask( Entity::Player& player, const uint32_t bnpcNameId, uint64_t delayTime );
 
     void onQueue() override;
     void execute() override;
@@ -18,7 +18,7 @@ namespace Sapphire::World
 
   private:
     uint32_t m_playerId;
-    std::string m_lootTable;
+    uint32_t m_bnpcId;
   };
 
   template< typename... Args >

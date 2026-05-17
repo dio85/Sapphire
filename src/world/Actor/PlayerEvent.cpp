@@ -84,9 +84,9 @@ bool Player::performResting()
 
   if( !m_actorIdTohateSlotMap.empty() )
   {
-    addHp = static_cast< uint32_t >( static_cast< float >( getMaxHp() ) * 0.01f + 1 );
-    addMp = static_cast< uint32_t >( static_cast< float >( getMaxMp() ) * 0.02f + 1 );
-    addTp = 60;
+    addHp = 0;
+    addMp = 0;
+    addTp = 0;
   }
 
   if( hasModifier( Common::ParamModifier::MpRestRegenSuppressed ) )

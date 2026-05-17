@@ -48,7 +48,6 @@
 #include <Task/LootBNpcTask.h>
 #include <Service.h>
 
-#include <Action/Action.h>
 #include <AI/GambitRule.h>
 #include <AI/GambitPack.h>
 #include <AI/GambitTargetCondition.h>
@@ -62,6 +61,7 @@
 #include <AI/Fsm/StateFollowPath.h>
 #include <AI/Fsm/StateResumePath.h>
 #include <AI/TargetHelper.h>
+#include <unordered_set>
 
 using namespace Sapphire;
 using namespace Sapphire::World;
@@ -508,7 +508,7 @@ void BNpc::sendPositionUpdate( uint64_t tickCount )
   m_lastRot = m_rot;
 }
 
-const Sapphire::Entity::HateList& BNpc::getHateList() const
+const std::set< std::shared_ptr< HateListEntry > >& BNpc::getHateList() const
 {
   return m_hateList;
 }
@@ -518,10 +518,8 @@ void BNpc::hateListClear()
   Network::Util::Packet::sendActorControl( getInRangePlayerIds(), getId(), ToggleWeapon, 0, 1, 1 );
   Network::Util::Packet::sendActorControl( getInRangePlayerIds(), getId(), SetBattle );
 
-  for( const auto& hatePair : m_hateList )
+  for( auto& listEntry : m_hateList )
   {
-    const auto& listEntry = hatePair.second;
-
     if( isInRangeSet( listEntry->m_pChara ) )
     {
       if( listEntry->m_pChara->isPlayer() )
@@ -533,24 +531,28 @@ void BNpc::hateListClear()
 
 uint32_t BNpc::hateListGetValue( const Sapphire::Entity::CharaPtr& pChara )
 {
-  auto pos = m_hateList.find( pChara->getId() );
-  if( pos != m_hateList.end() )
-    return pos->second->m_hateAmount;
+  for( const auto& listEntry : m_hateList )
+  {
+    if( listEntry->m_pChara == pChara )
+    {
+      return listEntry->m_hateAmount;
+    }
+  }
 
   return 0;
 }
 
 uint32_t BNpc::hateListGetHighestValue()
 {
+  auto it = m_hateList.begin();
   uint32_t maxHate = 0;
-  HateListEntryPtr entry;
-  for( const auto& hatePair : m_hateList )
+  std::shared_ptr< HateListEntry > entry;
+  for( ; it != m_hateList.end(); ++it )
   {
-    const auto& listEntry = hatePair.second;
-    if( listEntry->m_hateAmount > maxHate )
+    if( ( *it )->m_hateAmount > maxHate )
     {
-      maxHate = listEntry->m_hateAmount;
-      entry = listEntry;
+      maxHate = ( *it )->m_hateAmount;
+      entry = *it;
     }
   }
 
@@ -562,15 +564,15 @@ uint32_t BNpc::hateListGetHighestValue()
 
 CharaPtr BNpc::hateListGetHighest()
 {
+  auto it = m_hateList.begin();
   uint32_t maxHate = 0;
-  HateListEntryPtr entry;
-  for( const auto& hatePair : m_hateList )
+  std::shared_ptr< HateListEntry > entry;
+  for( ; it != m_hateList.end(); ++it )
   {
-    const auto& listEntry = hatePair.second;
-    if( listEntry->m_hateAmount > maxHate )
+    if( ( *it )->m_hateAmount > maxHate )
     {
-      maxHate = listEntry->m_hateAmount;
-      entry = listEntry;
+      maxHate = ( *it )->m_hateAmount;
+      entry = *it;
     }
   }
 
@@ -582,23 +584,13 @@ CharaPtr BNpc::hateListGetHighest()
 
 void BNpc::hateListAdd( const CharaPtr& pChara, int32_t hateAmount )
 {
-  if( !isAlive() )
-    return;
-
   if( hateAmount > 0 )
   {
-    auto pos = m_hateList.find( pChara->getId() );
-    if( pos != m_hateList.end() )
-    {
-      hateListUpdate( pChara, hateAmount );
-      return;
-    }
-
     auto hateEntry = std::make_shared< HateListEntry >();
     hateEntry->m_hateAmount = hateAmount;
     hateEntry->m_pChara = pChara;
 
-    m_hateList.emplace( pChara->getId(), hateEntry );
+    m_hateList.insert( hateEntry );
     if( pChara->isPlayer() )
     {
       auto pPlayer = pChara->getAsPlayer();
@@ -621,27 +613,30 @@ void BNpc::hateListAddDelayed( const CharaPtr& pChara, int32_t hateAmount )
 
 void BNpc::hateListUpdate( const CharaPtr& pChara, int32_t hateAmount )
 {
-  if( !isAlive() )
-    return;
+  bool hasEntry = false;
 
-  auto pos = m_hateList.find( pChara->getId() );
-  if( pos != m_hateList.end() )
+  for( const auto& listEntry : m_hateList )
   {
-    auto& listEntry = pos->second;
-    auto currentHate = listEntry->m_hateAmount;
-    if( hateAmount >= 0 || currentHate > abs( hateAmount ) )
-      listEntry->m_hateAmount += hateAmount;
-    else
-      listEntry->m_hateAmount = 0;
-
-    if( auto player = pChara->getAsPlayer() )
+    if( listEntry->m_pChara == pChara )
     {
-      player->hateListLetterUpdate( *this );
-      World::Manager::PlayerMgr::sendDebug( *player, "New Aggro: {}, Aggro gained: {}", listEntry->m_hateAmount,
-                                            hateAmount );
+      auto currentHate = listEntry->m_hateAmount;
+      if( hateAmount >= 0 || currentHate > abs( hateAmount ) )
+        listEntry->m_hateAmount += hateAmount;
+      else
+        listEntry->m_hateAmount = 0;
+      hasEntry = true;
+
+      if( auto player = pChara->getAsPlayer() )
+      {
+        player->hateListLetterUpdate( *this );
+        World::Manager::PlayerMgr::sendDebug( *player, "New Aggro: {}, Aggro gained: {}", listEntry->m_hateAmount,
+                                              hateAmount );
+      }
+      break;
     }
   }
-  else
+
+  if( !hasEntry )
   {
     hateListAdd( pChara, hateAmount );
   }
@@ -651,16 +646,19 @@ void BNpc::hateListUpdate( const CharaPtr& pChara, int32_t hateAmount )
 
 void BNpc::hateListRemove( const CharaPtr& pChara )
 {
-  auto pos = m_hateList.find( pChara->getId() );
-  if( pos == m_hateList.end() )
-    return;
-
-  m_hateList.erase( pos );
-
-  if( pChara->isPlayer() )
+  for( const auto& listEntry : m_hateList )
   {
-    PlayerPtr tmpPlayer = pChara->getAsPlayer();
-    tmpPlayer->onMobDeaggro( *this );
+    if( listEntry->m_pChara == pChara )
+    {
+      m_hateList.erase( listEntry );
+
+      if( pChara->isPlayer() )
+      {
+        PlayerPtr tmpPlayer = pChara->getAsPlayer();
+        tmpPlayer->onMobDeaggro( *this );
+      }
+      return;
+    }
   }
 }
 
@@ -676,16 +674,16 @@ void BNpc::setTriggerOwnerId( uint32_t triggerOwnerId )
 
 bool BNpc::hateListHasActor( const Sapphire::Entity::CharaPtr& pChara )
 {
-  return m_hateList.find( pChara->getId() ) != m_hateList.end();
+  return std::any_of( m_hateList.begin(), m_hateList.end(),
+                      [ pChara ]( const auto& entry ) { return entry->m_pChara == pChara; } );
 }
 
 std::vector< CharaPtr > BNpc::getHateList()
 {
   std::vector< CharaPtr > hateList = {};
 
-  for( const auto& hatePair : m_hateList )
+  for( auto& entry : m_hateList )
   {
-    const auto& entry = hatePair.second;
     hateList.push_back( entry->m_pChara );
   }
 
@@ -694,9 +692,8 @@ std::vector< CharaPtr > BNpc::getHateList()
 
 void BNpc::hateListUpdatePlayers()
 {
-  for( const auto& hatePair : m_hateList )
+  for( const auto& listEntry : m_hateList )
   {
-    const auto& listEntry = hatePair.second;
     // update entire hatelist for all players who are on aggro with this bnpc
     if( listEntry->m_pChara->isPlayer() )
     {
@@ -861,7 +858,8 @@ void BNpc::onDeath()
   uint32_t baseExp = paramGrowthInfo->data().BaseExp;
 
   auto calcExpModifier = []( int16_t levelDiff ) -> float {
-    if( levelDiff >= 6 ) return 1.5f;// Incredibly Tough
+    if( levelDiff >= 6 )
+      return 1.5f;// Incredibly Tough
     else if( levelDiff >= 3 )
       return 1.2f;// Tough - Very Tough
     else if( levelDiff >= -2 )
@@ -872,63 +870,118 @@ void BNpc::onDeath()
       return 0.0f;// Too Weak
   };
 
-  // --- hate list ---
+  // Prevent duplicate rewards
+  std::unordered_set< uint64_t > rewardedParties;
+  std::unordered_set< uint64_t > rewardedPlayers;
+
   for( const auto& pHateEntry : m_hateList )
   {
-    const auto& pHateEntry = hatePair.second;
     auto pPlayer = pHateEntry->m_pChara->getAsPlayer();
+
     if( !pPlayer )
       continue;
 
-    // Loot queue
-    taskMgr.queueTask( makeLootBNpcTask( *pPlayer, "testTable", 2000 ) );
-
-    // Callback
-    playerMgr.onMobKill( *pPlayer, *this );
-
-    // --- EXP calculation ---
-    uint16_t playerLevel = pPlayer->getLevel();
-    int16_t levelDiff = static_cast< int16_t >( m_level ) - static_cast< int16_t >( playerLevel );
-
-    float modifier = calcExpModifier( levelDiff );
-    uint32_t finalExp = static_cast< uint32_t >( baseExp * modifier );
-
+    // =========================
+    // PARTY XP
+    // =========================
     if( pPlayer->getPartyId() != 0 )
     {
-      auto party = partyMgr.getParty( pPlayer->getPartyId() );
-      if( party )
+      auto partyId = pPlayer->getPartyId();
+
+      // Already rewarded this party
+      if( rewardedParties.find( partyId ) != rewardedParties.end() )
+        continue;
+
+      rewardedParties.insert( partyId );
+
+      auto members = partyMgr.getMembers( partyId );
+
+      for( auto& member : members )
       {
-        auto members = partyMgr.getMembers( pPlayer->getPartyId() );
-        for( auto& member : members )
-        {
-          if( !member || !member->isAlive() )
-            continue;
+        if( !member )
+          continue;
 
-          
-          int16_t diff = static_cast< int16_t >( m_level ) - static_cast< int16_t >( member->getLevel() );
-          float mod = calcExpModifier( diff );
-          uint32_t expToGive = static_cast< uint32_t >( baseExp * mod );
+        if( !member->isAlive() )
+          continue;
 
-          // Party size penalty
-          if( members.size() > 1 )
-            expToGive /= members.size();
+        // Optional retail-like distance check
+        float distance = Common::Util::distance( member->getPos(), getPos() );
+        if( distance > 100.0f )
+          continue;
 
-          if( mod > 0.0f && expToGive < 1 ) expToGive = 1;
+        // Quest / kill callback
+        playerMgr.onMobKill( *member, *this );
 
+        // Loot
+        taskMgr.queueTask(
+                makeLootBNpcTask(
+                        *member,
+                        m_pInfo->NameId,
+                        2000 ) );
+
+        // EXP
+        int16_t diff = static_cast< int16_t >( m_level ) -
+                       static_cast< int16_t >( member->getLevel() );
+
+        float mod = calcExpModifier( diff );
+
+        uint32_t expToGive =
+                static_cast< uint32_t >( baseExp * mod );
+
+        // Party split
+        if( members.size() > 1 )
+          expToGive /= members.size();
+
+        // Minimum EXP
+        if( mod > 0.0f && expToGive == 0 )
+          expToGive = 1;
+
+        if( expToGive > 0 )
           playerMgr.onGainExp( *member, expToGive );
-        }
       }
     }
+    // =========================
+    // SOLO XP
+    // =========================
     else
     {
-      // Solo
-      if( modifier > 0.0f && finalExp < 1 )
-        finalExp = 1;
+      auto charId = pPlayer->getCharacterId();
 
-      playerMgr.onGainExp( *pPlayer, finalExp );
-      playerMgr.sendDebug( *pPlayer, ( "Killed Layout ID: " + std::to_string( getLayoutId() ) ) );
+      // Already rewarded this player
+      if( rewardedPlayers.find( charId ) != rewardedPlayers.end() )
+        continue;
+
+      rewardedPlayers.insert( charId );
+
+      // Quest / kill callback
       playerMgr.onMobKill( *pPlayer, *this );
 
+      // Loot
+      taskMgr.queueTask(
+              makeLootBNpcTask( *pPlayer, m_pInfo->NameId, 2000 ) );
+
+      // EXP
+      uint16_t playerLevel = pPlayer->getLevel();
+
+      int16_t levelDiff =
+              static_cast< int16_t >( m_level ) -
+              static_cast< int16_t >( playerLevel );
+
+      float modifier = calcExpModifier( levelDiff );
+
+      uint32_t finalExp =
+              static_cast< uint32_t >( baseExp * modifier );
+
+      if( modifier > 0.0f && finalExp == 0 )
+        finalExp = 1;
+
+      if( finalExp > 0 )
+        playerMgr.onGainExp( *pPlayer, finalExp );
+
+      playerMgr.sendDebug(
+              *pPlayer,
+              ( "Killed Layout ID: " +
+                std::to_string( getLayoutId() ) ) );
     }
   }
 

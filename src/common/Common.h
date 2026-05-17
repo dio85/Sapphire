@@ -1988,6 +1988,7 @@ namespace Sapphire::Common
     uint16_t EventGroup;
     uint32_t NameId;
     uint32_t DropItem;
+    std::string lootTable;
     float SenseRangeRate;
     uint16_t Level;
     uint8_t ActiveType;

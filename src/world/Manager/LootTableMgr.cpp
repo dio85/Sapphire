@@ -9,31 +9,142 @@
 
 #include <Random/RNGMgr.h>
 #include "LootTableMgr.h"
+#include <Database/DatabaseDef.h>
+#include <unordered_set>
 
 using namespace Sapphire;
 using namespace Sapphire::World::Loot;
 using namespace Sapphire::World::Manager;
 namespace fs = std::filesystem;
 
+Sapphire::Db::DbWorkerPool< Sapphire::Db::ZoneDbConnection > g_charaDb;
+
 bool LootTableMgr::cacheLootTables()
 {
-  std::fstream f;
+  m_tempTableIds.clear();
+  m_tempPools.clear();
 
-  for( auto& p : fs::recursive_directory_iterator( "data/lootTables/" ) )
+  Logger::info( "LootTableMgr: cacheLootTables start" );
+
+  if( !loadLootTable() )
+    return false;
+
+  if( !LoadLootPools() )
+    return false;
+
+  if( !LoadLootPoolItems() )
+    return false;
+
+  return true;
+}
+
+bool LootTableMgr::loadLootTable()
+{
+  auto& db = Common::Service< Db::DbWorkerPool< Db::ZoneDbConnection > >::ref();
+
+  auto stmt = db.getPreparedStatement(
+          Db::ZoneDbStatements::LOOT_SEL_TABLES );
+
+   auto res = db.query( stmt );
+
+  while( res->next() )
   {
-    if( p.path().extension() == ".json" )
-    {
-      std::ifstream f( p.path() );
-      if( !f )
-        return false;
+    uint32_t id = res->getUInt( "id" );
 
-      nlohmann::json j;
-      f >> j;
+    auto lootTable = std::make_shared< LootTable >();
+    lootTable->lootTable = res->getString( "name" );
 
-      LootTable lootTable = j.get< LootTable >();
+    m_lootTableMap[ lootTable->lootTable ] = lootTable;
+    m_tempTableIds[ id ] = lootTable;
 
-      m_lootTableMap.try_emplace( lootTable.lootTable, std::make_shared< LootTable >( lootTable ) );
-    }
+    Logger::info(
+            "Loaded loot table {} with id {}",
+            lootTable->lootTable,
+            id );
+  }
+
+  return true;
+}
+
+bool LootTableMgr::LoadLootPools()
+{
+  auto& db = Common::Service< Db::DbWorkerPool< Db::ZoneDbConnection > >::ref();
+
+  auto stmt = db.getPreparedStatement(
+          Db::ZoneDbStatements::LOOT_SEL_POOLS );
+
+  auto res = db.query( stmt );
+
+  while( res->next() )
+  {
+    uint32_t id = res->getUInt( "id" );
+    uint32_t lootTableId = res->getUInt( "loot_table_id" );
+
+    auto tableIt = m_tempTableIds.find( lootTableId );
+    if( tableIt == m_tempTableIds.end() )
+      continue;
+
+    LootTablePool pool;
+    pool.name = res->getString( "name" );
+    pool.enabled = res->getBoolean( "enabled" );
+    pool.duplicates = res->getBoolean( "duplicates" );
+    pool.pick.min = res->getUInt( "pick_min" );
+    pool.pick.max = res->getUInt( "pick_max" );
+
+    auto& tablePools = tableIt->second->pools;
+
+    tablePools.push_back( pool );
+
+    // pointer valid (deque miatt stabil)
+    LootTablePool* poolPtr = &tablePools.back();
+
+    TempPoolRef ref;
+    ref.pool = poolPtr;
+
+    m_tempPools[ id ] = ref;
+
+    Logger::info(
+            "Loaded loot pool {} for table {}",
+            pool.name,
+            lootTableId );
+  }
+
+  return true;
+}
+
+bool LootTableMgr::LoadLootPoolItems()
+{
+  auto& db = Common::Service< Db::DbWorkerPool< Db::ZoneDbConnection > >::ref();
+
+  auto stmt = db.getPreparedStatement(
+          Db::ZoneDbStatements::LOOT_SEL_ITEMS );
+
+  auto res = db.query( stmt );
+
+  while( res->next() )
+  {
+    uint32_t poolId = res->getUInt( "pool_id" );
+
+    auto poolIt = m_tempPools.find( poolId );
+    if( poolIt == m_tempPools.end() || poolIt->second.pool == nullptr )
+      continue;
+
+    auto* pool = poolIt->second.pool;
+
+    LootTableItem item;
+    item.id = res->getUInt( "item_id" );
+    item.weight = res->getUInt( "weight" );
+    item.isHq = res->getBoolean( "is_hq" );
+    item.quantity.min = res->getUInt( "qty_min" );
+    item.quantity.max = res->getUInt( "qty_max" );
+
+    pool->items.push_back( item );
+
+    Logger::info(
+            "Loaded loot item {} weight {} for pool {}",
+            item.id,
+            item.weight,
+            poolId );
   }
 
   return true;
@@ -48,65 +159,115 @@ LootTablePtr LootTableMgr::getLootTableByName( const std::string& name )
     return it->second;
 }
 
+LootTableResult LootTableMgr::rollLootForBNpc( uint32_t bnpcNameId )
+{
+  auto it = m_tempTableIds.find( bnpcNameId );
+
+  if( it == m_tempTableIds.end() || !it->second )
+  {
+    Logger::error( "LootTable not found for BNpcNameId: {}", bnpcNameId );
+    return {};
+  }
+
+  return rollLoot( it->second->lootTable );
+}
+
 LootTableResult LootTableMgr::rollLoot( const std::string& name )
 {
   auto& RNGMgr = Common::Service< Common::Random::RNGMgr >::ref();
 
   LootTableResult result;
 
-  if( auto pLootTable = getLootTableByName( name ); pLootTable )
+  auto pLootTable = getLootTableByName( name );
+  if( !pLootTable )
   {
-    Logger::info( "LootTableMgr: Rolling for " + name );
-    result.name = pLootTable->lootTable;
+    Logger::error( "LootTable missing: {}", name );
+    return {};
+  }
 
-    for( const auto& pool : pLootTable->pools )
+  result.name = pLootTable->lootTable;
+
+  for( const auto& pool : pLootTable->pools )
+  {
+    if( !pool.enabled )
+      continue;
+
+    if( pool.pick.min > pool.pick.max )
     {
-      if( !pool.enabled )
-        continue;
-
-      auto pickCountGen = RNGMgr.getRandGenerator< uint32_t >( pool.pick.min, pool.pick.max );
-      uint32_t picks = pickCountGen.next();
-
-      std::vector< LootTableItem > available = pool.items;
-
-      for( auto i = 0; i < picks && !available.empty(); ++i )
-      {
-        const auto& item = pickWeightedItem( available );
-
-        auto itemCountGen = RNGMgr.getRandGenerator< uint32_t >( item.quantity.min, item.quantity.max );
-        uint32_t qty = itemCountGen.next();
-
-        result.items.push_back( { item.id, qty, item.isHq } );
-
-        if( !pool.duplicates )
-        {
-          available.erase( std::remove_if( available.begin(), available.end(),
-                  [ & ]( const auto& x ) { return x.id == item.id; } ),
-                  available.end() );
-        }
-      }
+      Logger::error( "Invalid pick range in pool {}", pool.name );
+      continue;
     }
 
-    Logger::debug( "LootTableMgr: Rolled total of {0} item results", result.count() );
+    if( pool.items.empty() )
+      continue;
+
+    auto pickGen = RNGMgr.getRandGenerator< uint32_t >( pool.pick.min, pool.pick.max );
+    uint32_t picks = pickGen.next();
+
+    std::unordered_set< uint32_t > usedItems;
+
+    uint32_t attempts = 0;
+    const uint32_t maxAttempts = picks * 3;// anti infinite skip bias
+
+    while( result.count() < picks && attempts < maxAttempts )
+    {
+      attempts++;
+
+      const auto& item = pickWeightedItem( pool.items );
+
+      if( item.weight == 0 )
+        continue;
+
+      if( item.quantity.min > item.quantity.max )
+      {
+        Logger::error( "Invalid qty range item {}", item.id );
+        continue;
+      }
+
+      if( !pool.duplicates )
+      {
+        if( usedItems.find( item.id ) != usedItems.end() )
+          continue;
+
+        usedItems.insert( item.id );
+      }
+
+      auto qtyGen = RNGMgr.getRandGenerator< uint32_t >(
+              item.quantity.min,
+              item.quantity.max );
+
+      uint32_t qty = qtyGen.next();
+      if( qty == 0 )
+        qty = 1;
+
+      result.items.push_back( { item.id, qty, item.isHq } );
+    }
   }
-    
+
   return result;
 }
 
-const LootTableItem& LootTableMgr::pickWeightedItem( const std::vector< LootTableItem >& items )
+const LootTableItem& LootTableMgr::pickWeightedItem(
+        const std::vector< LootTableItem >& items )
 {
   auto& RNGMgr = Common::Service< Common::Random::RNGMgr >::ref();
-  // calc total weight
+
+  if( items.empty() )
+    throw std::runtime_error( "Empty loot pool" );
+
   uint32_t totalWeight = 0;
+
   for( const auto& it : items )
     totalWeight += it.weight;
 
-  // roll for [1, totalWeight]
-  auto randGen = RNGMgr.getRandGenerator< uint32_t >( 1, totalWeight );
-  uint32_t roll = randGen.next();
+  if( totalWeight == 0 )
+    throw std::runtime_error( "All loot weights are zero" );
 
-  // get item pick
+  auto gen = RNGMgr.getRandGenerator< uint32_t >( 1, totalWeight );
+  uint32_t roll = gen.next();
+
   uint32_t cumulative = 0;
+
   for( const auto& it : items )
   {
     cumulative += it.weight;
@@ -114,5 +275,5 @@ const LootTableItem& LootTableMgr::pickWeightedItem( const std::vector< LootTabl
       return it;
   }
 
-  throw std::runtime_error( "LootTableMgr: pickWeightedItem roll exceeded total weight" );
+  return items.back();// fallback safety
 }

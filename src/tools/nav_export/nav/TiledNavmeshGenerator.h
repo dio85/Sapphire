@@ -26,15 +26,22 @@
 // todo: this no worky
 struct PrintContext : rcContext {
   explicit PrintContext( bool state = true ) : rcContext( state ) {}
+
 protected:
   void doLog( const rcLogCategory category, const char* msg, const int /*len*/ ) override
   {
     const char* catStr = "";
     switch( category )
     {
-      case RC_LOG_PROGRESS: catStr = "PROGRESS"; break;
-      case RC_LOG_WARNING:  catStr = "WARNING";  break;
-      case RC_LOG_ERROR:    catStr = "ERROR";    break;
+      case RC_LOG_PROGRESS:
+        catStr = "PROGRESS";
+        break;
+      case RC_LOG_WARNING:
+        catStr = "WARNING";
+        break;
+      case RC_LOG_ERROR:
+        catStr = "ERROR";
+        break;
     }
     printf( "[Recast %s] %s\n", catStr, msg );
     fflush( stdout );
@@ -127,8 +134,7 @@ static const int MAX_LAYERS = 32;
 static const int TILECACHESET_MAGIC = 'T' << 24 | 'S' << 16 | 'E' << 8 | 'T';//'TSET';
 static const int TILECACHESET_VERSION = 1;
 
-struct TileCacheSetHeader
-{
+struct TileCacheSetHeader {
   int magic;
   int version;
   int numTiles;
@@ -136,14 +142,12 @@ struct TileCacheSetHeader
   dtTileCacheParams cacheParams;
 };
 
-struct TileCacheData
-{
+struct TileCacheData {
   unsigned char* data;
   int dataSize;
 };
 
-struct TileCacheTileHeader
-{
+struct TileCacheTileHeader {
   dtCompressedTileRef tileRef;
   int dataSize;
 };
@@ -175,8 +179,6 @@ struct RasterizationContext {
 class TiledNavmeshGenerator
 {
 public:
-
-
   TiledNavmeshGenerator() = default;
   ~TiledNavmeshGenerator();
 
@@ -249,8 +251,7 @@ private:
 
   float m_detailSampleDist = 6.f;
   float m_detailSampleMaxError = 1.f;
-
 };
 
 
-#endif //SAPPHIRE_TILEDNAVMESHGENERATOR_H
+#endif//SAPPHIRE_TILEDNAVMESHGENERATOR_H

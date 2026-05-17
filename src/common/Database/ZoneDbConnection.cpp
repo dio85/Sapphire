@@ -445,4 +445,20 @@ void Sapphire::Db::ZoneDbConnection::doPrepareStatements()
                     "SELECT CharacterId FROM charainfo WHERE Name = ?;",
                     CONNECTION_SYNC );
 
+  prepareStatement( LOOT_SEL_TABLES,
+                    "SELECT id, name, type FROM loot_tables;",
+                    CONNECTION_SYNC );
+
+  prepareStatement( LOOT_SEL_POOLS,
+                    "SELECT id, loot_table_id, name, enabled, duplicates, "
+                    "pick_min, pick_max "
+                    "FROM loot_pools;",
+                    CONNECTION_SYNC );
+
+  prepareStatement( LOOT_SEL_ITEMS,
+                    "SELECT id, pool_id, item_id, weight, is_hq, "
+                    "qty_min, qty_max "
+                    "FROM loot_pool_items;",
+                    CONNECTION_SYNC );
+
 }

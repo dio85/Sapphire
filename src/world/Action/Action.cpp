@@ -560,7 +560,7 @@ std::pair< uint32_t, Common::CalcResultType > Action::Action::calcDamage( uint32
 
 std::pair< uint32_t, Common::CalcResultType > Action::Action::calcHealing( uint32_t potency )
 {
-  auto wepDmg = 1.f;
+  float wepDmg = 1.f;
 
   if( auto player = m_pSource->getAsPlayer() )
   {
@@ -574,7 +574,11 @@ std::pair< uint32_t, Common::CalcResultType > Action::Action::calcHealing( uint3
       wepDmg = item->getPhysicalDmg();
   }
 
-  return Math::CalcStats::calcActionHealing( *m_pSource, potency, wepDmg );
+   auto result = Math::CalcStats::calcActionHealing( *m_pSource, potency, wepDmg );
+
+  return {
+          static_cast< uint32_t >( std::lround( result.first ) ),
+          result.second };
 }
 
 void Action::Action::buildActionResults()

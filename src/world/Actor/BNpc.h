@@ -116,7 +116,7 @@ namespace Sapphire::Entity
 
     float getCurrentSpeed() const;
 
-    const HateList& getHateList() const;
+     const std::set< std::shared_ptr< HateListEntry > >& getHateList() const;
     void hateListClear();
     uint32_t hateListGetValue( const Sapphire::Entity::CharaPtr& pChara );
     uint32_t hateListGetHighestValue();
@@ -242,7 +242,7 @@ namespace Sapphire::Entity
     uint64_t m_lastPosUpdate{0};
 
     BNpcState m_state;
-    HateList m_hateList;
+    std::set< std::shared_ptr< HateListEntry > > m_hateList;
     bool m_canSwapTarget{ true };
 
     uint64_t m_naviLastUpdate;

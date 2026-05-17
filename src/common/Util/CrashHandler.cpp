@@ -14,7 +14,7 @@
 #include <intrin.h>
 #include <dbghelp.h>
 
-#pragma comment(lib, "dbghelp.lib")
+#pragma comment( lib, "dbghelp.lib" )
 
 inline std::string basename( const std::string& file )
 {
@@ -36,7 +36,7 @@ inline std::string basename( const std::string& file )
 #include <string>
 
 // Minimal, crash-safe logging (avoid spdlog in signal handlers)
-static void safe_log_line( const char *msg )
+static void safe_log_line( const char* msg )
 {
 #ifdef _WIN32
   OutputDebugStringA( msg );
@@ -47,7 +47,7 @@ static void safe_log_line( const char *msg )
   std::fflush( stderr );
 }
 
-static void safe_logf( const char *fmt, ... )
+static void safe_logf( const char* fmt, ... )
 {
   char buf[ 2048 ];
   va_list args;
@@ -77,8 +77,11 @@ Util::CrashHandler::CrashHandler()
 
 void Util::CrashHandler::signalHandler( int sigNum )
 {
-#define ADD_SIGNAL_MAP( x ) case x: name = #x; break;
-  const char *name = nullptr;
+#define ADD_SIGNAL_MAP( x ) \
+  case x:                   \
+    name = #x;              \
+    break;
+  const char* name = nullptr;
   switch( sigNum )
   {
     ADD_SIGNAL_MAP( SIGABRT );
@@ -86,8 +89,8 @@ void Util::CrashHandler::signalHandler( int sigNum )
     ADD_SIGNAL_MAP( SIGILL );
     ADD_SIGNAL_MAP( SIGFPE );
 #ifndef _WIN32
-      // SIGBUS not supported on windows
-      ADD_SIGNAL_MAP( SIGBUS );
+    // SIGBUS not supported on windows
+    ADD_SIGNAL_MAP( SIGBUS );
 #endif
   }
 #undef ADD_SIGNAL_MAP
@@ -116,9 +119,9 @@ void Util::CrashHandler::printStackTrace( unsigned int max_frames )
   // used as is from: https://oroboro.com/stack-trace-on-crash/
   // only changes output slightly
 
-  void *addrlist[ max_frames + 1 ];
+  void* addrlist[ max_frames + 1 ];
 
-  int addrlen = backtrace( addrlist, sizeof( addrlist ) / sizeof( void * ) );
+  int addrlen = backtrace( addrlist, sizeof( addrlist ) / sizeof( void* ) );
 
   if( addrlen == 0 )
   {
@@ -126,7 +129,7 @@ void Util::CrashHandler::printStackTrace( unsigned int max_frames )
     return;
   }
 
-  char **symbollist = backtrace_symbols( addrlist, addrlen );
+  char** symbollist = backtrace_symbols( addrlist, addrlen );
 
   size_t funcnamesize = 1024;
   char funcname[ 1024 ];
@@ -135,12 +138,12 @@ void Util::CrashHandler::printStackTrace( unsigned int max_frames )
   // address of this function.
   for( unsigned int i = 0; i < addrlen; i++ )
   {
-    char *begin_name = NULL;
-    char *begin_offset = NULL;
-    char *end_offset = NULL;
+    char* begin_name = NULL;
+    char* begin_offset = NULL;
+    char* end_offset = NULL;
 
     // find parentheses and +address offset surrounding the mangled name
-    for( char *p = symbollist[ i ]; *p; ++p )
+    for( char* p = symbollist[ i ]; *p; ++p )
     {
       if( *p == '(' )
         begin_name = p;
@@ -162,13 +165,13 @@ void Util::CrashHandler::printStackTrace( unsigned int max_frames )
       // __cxa_demangle():
 
       int status = 0;
-      char *ret = abi::__cxa_demangle( begin_name, funcname,
+      char* ret = abi::__cxa_demangle( begin_name, funcname,
                                        &funcnamesize, &status );
-      char *fname = begin_name;
+      char* fname = begin_name;
       if( status == 0 )
         fname = ret;
 
-      const char *format = " {} {:40} {} + {}";
+      const char* format = " {} {:40} {} + {}";
 
       if( begin_offset )
       {
